@@ -38,8 +38,12 @@
 enum { LS_COMPRESS_AUTO = 0, LS_COMPRESS_ON = 1, LS_COMPRESS_OFF = 2 };
 /* auto 模式下，采样平均熵低于这个值才压 */
 #define LS_COMPRESS_ENTROPY_MAX 6.5
-/* 压缩级别：以速度优先，见 common.c 里的说明 */
+/* 压缩级别初值；运行时会按实测吞吐自动调整并持久化到配置文件 */
 #define LS_COMPRESS_LEVEL 1
+void ls_set_compress_level(int lv);
+int  ls_compress_level(void);
+/* 从我们自己写的 JSON 里取数值（格式固定，够用即可） */
+double ls_cfg_get(const char *json, const char *key, double def);
 
 /* 一个 bundle 最多装多少字节 / 多少个条目，超过就切开 */
 #define LS_BUNDLE_BYTES (64ull * 1024 * 1024)

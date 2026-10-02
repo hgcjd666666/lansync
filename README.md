@@ -251,6 +251,40 @@ DBG  [phone] 本批推送 3 个文件，6.7 MiB（已压缩）
 jpg/mp4/zip/apk 的熵在 7.5 以上，压了白费 CPU，auto 会自动跳过。
 客户端不需要配置——按 `BUNDLE_BEGIN` 里的标志解压。
 
+## 性能剖析与自动调参
+
+服务端每轮同步结束会写一份 `lansync-server.json`（`--config PATH` 可改）：
+
+```json
+{
+  "role": "server",
+  "total_ms": 22,
+  "bytes_raw": 700000,
+  "bytes_wire": 203283,
+  "bottleneck": "transfer",
+  "compress_level": 1,
+  "phases": [
+    {"name": "scan",     "ms": 0,  "pct": 0.0,  "detail": "3 个文件"},
+    {"name": "transfer", "ms": 19, "pct": 86.4, "detail": "3 推送 / 0 拉取"}
+  ]
+}
+```
+
+日志里也会直接给结论，不用翻文件：
+
+```
+性能：耗时 22 ms，瓶颈是「transfer」占 86%；传输 683.6 KiB（线上 198.5 KiB）
+```
+
+**自动调参**：`compress_level` 会被读回来用在下一轮，并按实测调整：
+
+| 实测 | 调整 |
+|---|---|
+| 吞吐 < 8 MB/s | 多半是压缩拖后腿 → 级别 −1 |
+| 吞吐 > 25 MB/s 且压缩率 > 50% | 压得更狠省带宽 → 级别 +1 |
+
+客户端**不写配置文件**——它默认几乎不发送数据，调参没有意义，结论只打在日志里。
+
 ## 熵值分析
 
 `entropy` 命令可以单独看一个目录值不值得压：

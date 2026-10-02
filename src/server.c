@@ -55,6 +55,7 @@ static int               g_listen_fd = -1;
 static volatile sig_atomic_t g_stop = 0;
 static pthread_mutex_t   g_sync_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned long     g_seq = 0;
+static const char       *g_profile_path = NULL; /* --config 指定；NULL 用默认名 */
 
 /* ---------------- 小工具 ---------------- */
 
@@ -229,6 +230,37 @@ static LsSink *srv_sink_factory(void *ctx, const char *rel, uint64_t size, int64
         ls_set_last_error("%s", err);
     }
     return s;
+}
+
+/*
+ * 自动调参：用一次同步实测到的吞吐和压缩率决定下一轮的压缩级别。
+ * 网络没跑满（< 8 MB/s）多半是压缩在拖后腿，降级；跑满了就压得更狠省带宽。
+ * 结果写回配置文件，下次启动读回来。
+ */
+static void adapt_compress(Profile *prof)
+{
+    uint64_t total_ms = ls_now_ms() - prof->t_start;
+    if (prof->bytes_wire == 0 || total_ms == 0) {
+        return; /* 这次没传东西，别瞎调 */
+    }
+    double mbps = (double)prof->bytes_wire / 1048576.0 / ((double)total_ms / 1000.0);
+    double ratio = prof->bytes_raw > 0 ? (double)prof->bytes_wire / (double)prof->bytes_raw
+                                       : 1.0;
+    int lv = ls_compress_level();
+    int nv = lv;
+    if (mbps < 8.0) {
+        nv = lv > 1 ? lv - 1 : 1;
+    } else if (mbps > 25.0 && ratio > 0.5 && lv < 9) {
+        nv = lv + 1;
+    }
+    if (nv != lv) {
+        ls_log("自动调参：压缩级别 %d -> %d（本次吞吐 %.1f MB/s，压缩率 %.0f%%）", lv, nv, mbps,
+               ratio * 100.0);
+        ls_set_compress_level(nv);
+    } else {
+        ls_dbg("自动调参：保持压缩级别 %d（吞吐 %.1f MB/s，压缩率 %.0f%%）", lv, mbps,
+               ratio * 100.0);
+    }
 }
 
 /* 把一批文件放进一个 bundle 发给客户端 */
@@ -431,16 +463,22 @@ static void do_sync(Client *c, const Buf *list_begin)
     flist_init(&local);
     memset(&plan, 0, sizeof(plan));
 
+    prof_begin("list_in");
     if (recv_list(c->fd, list_begin, &remote) != 0) {
+        prof_end("失败");
         ls_log("[%s] 未收到有效的文件清单，放弃本次同步", c->name);
         goto out;
     }
+    prof_end("%zu 个条目", remote.n);
 
     char err[512];
+    prof_begin("scan");
     if (fs_scan(g_root, &local, err, sizeof(err)) != 0) {
+        prof_end("失败");
         ls_log("[%s] 本地扫描失败：%s", c->name, err);
         goto out;
     }
+    prof_end("%zu 个文件", local.n);
 
     ls_log("[%s] 扫描完成：客户端 %zu 个文件 / 服务端 %zu 个文件%s", c->name, remote.n,
            local.n, c->mtime_ok ? "" : "（按大小比对）");
@@ -455,6 +493,7 @@ static void do_sync(Client *c, const Buf *list_begin)
      * 而 mtime 只有在「同一个文件在同一毫秒内被重写」这种极端情况下才会撞车，
      * 真实场景里文件被编辑过 mtime 就会变，可靠性反而高得多，且零读取。
      */
+    prof_begin("diff");
     for (size_t i = 0; i < local.n; i++) {
         FileEntry *le = &local.v[i];
         FileEntry *re = flist_find(&remote, le->rel);
@@ -505,12 +544,16 @@ static void do_sync(Client *c, const Buf *list_begin)
         }
     }
 
+    prof_end("相同 %u / 待传 %zu", c->st.same, plan.n);
+
     if (by_size > 0) {
         ls_log("[%s] 其中 %u 个文件只是大小相同就判为相同（客户端保不住 mtime，没能比对时间）",
                c->name, by_size);
     }
 
+    prof_begin("transfer");
     run_plan(c, &plan);
+    prof_end("%u 推送 / %u 拉取", c->st.pushed, c->st.pulled);
 
 out:
     plan_free(&plan);
@@ -555,7 +598,11 @@ static void send_self(Client *c)
 static void *client_thread(void *arg)
 {
     Client *c = (Client *)arg;
+    Profile prof;
     Buf b;
+
+    prof_init(&prof, "server", g_root, c->peer);
+    prof_bind(&prof);
 
     /* 1. HELLO */
     buf_init(&b);
@@ -664,6 +711,9 @@ static void *client_thread(void *arg)
     }
 
 out:
+    adapt_compress(&prof);
+    prof_finish(&prof, g_profile_path);
+    prof_bind(NULL);
     close(c->fd);
     free(c);
     return NULL;
@@ -760,6 +810,7 @@ static void usage(const char *prog, int debug)
         "      --allow-upload       允许客户端把文件写回服务端（默认拒绝）\n"
         "      --merge              双向合并 = --prefer newer --keep-extra --allow-upload\n"
         "      --compress MODE      传输压缩 auto(默认) | on | off\n"
+        "      --config PATH        剖析/配置文件（默认 lansync-server.json）\n"
         "\n"
         "网络\n"
         "  -p, --port PORT          TCP 端口（默认 %d）\n"
@@ -787,7 +838,7 @@ static void usage(const char *prog, int debug)
 int server_main(int argc, char **argv)
 {
     enum { OPT_PREFER = 1000, OPT_KEEP, OPT_MERGE, OPT_NOANN, OPT_SUBDIR, OPT_DIST,
-           OPT_UPLOAD, OPT_COMPRESS, OPT_NOCOMPRESS, OPT_HDEBUG };
+           OPT_UPLOAD, OPT_COMPRESS, OPT_NOCOMPRESS, OPT_CONFIG, OPT_HDEBUG };
     static const struct option opts[] = {
         {"dir", required_argument, 0, 'd'},
         {"port", required_argument, 0, 'p'},
@@ -797,6 +848,7 @@ int server_main(int argc, char **argv)
         {"keep-extra", no_argument, 0, OPT_KEEP},
         {"merge", no_argument, 0, OPT_MERGE},
         {"allow-upload", no_argument, 0, OPT_UPLOAD},
+        {"config", required_argument, 0, OPT_CONFIG},
         {"compress", required_argument, 0, OPT_COMPRESS},
         {"no-compress", no_argument, 0, OPT_NOCOMPRESS},
         {"no-announce", no_argument, 0, OPT_NOANN},
@@ -835,6 +887,7 @@ int server_main(int argc, char **argv)
             g_allow_upload = 1;
             break;
         case OPT_UPLOAD: g_allow_upload = 1; break;
+        case OPT_CONFIG: g_profile_path = optarg; break;
         case OPT_COMPRESS:
             if (strcmp(optarg, "auto") == 0) {
                 g_compress = LS_COMPRESS_AUTO;
@@ -898,6 +951,22 @@ int server_main(int argc, char **argv)
     if (g_listen_fd < 0) {
         fprintf(stderr, "监听 TCP %u 失败：%s\n", g_port, strerror(errno));
         return 1;
+    }
+
+    /* 读回上次调好的压缩级别 */
+    {
+        const char *cfg = g_profile_path ? g_profile_path : "lansync-server.json";
+        FILE *cf = fopen(cfg, "r");
+        if (cf) {
+            char buf[8192];
+            size_t n = fread(buf, 1, sizeof(buf) - 1, cf);
+            fclose(cf);
+            buf[n] = '\0';
+            double lv = ls_cfg_get(buf, "compress_level", LS_COMPRESS_LEVEL);
+            if (lv >= 1 && lv <= 9) {
+                ls_set_compress_level((int)lv);
+            }
+        }
     }
 
     ls_log("%s", ls_build_info());

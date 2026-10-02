@@ -399,8 +399,14 @@ void prof_finish(Profile *p, const char *path)
     char outpath[LS_PATHMAX];
     if (path && *path) {
         snprintf(outpath, sizeof(outpath), "%s", path);
+    } else if (strcmp(p->role, "server") == 0) {
+        /* 服务端要持久化压缩级别，供下次启动读回 */
+        snprintf(outpath, sizeof(outpath), "lansync-server.json");
     } else {
-        snprintf(outpath, sizeof(outpath), "lansync-profile-%s.json", p->role);
+        /* 客户端不需要配置文件：它默认几乎不发送数据，调参没意义。
+         * 结论已经打在日志里了，够了。 */
+        p->active = 0;
+        return;
     }
 
     FILE *f = fopen(outpath, "w");
@@ -424,20 +430,23 @@ void prof_finish(Profile *p, const char *path)
     fprintf(f, "  \"bytes_raw\": %llu,\n", (unsigned long long)p->bytes_raw);
     fprintf(f, "  \"bytes_wire\": %llu,\n", (unsigned long long)p->bytes_wire);
     fprintf(f, "  \"bottleneck\": \"%s\",\n", worst ? worst->name : "");
+    fprintf(f, "  \"compress_level\": %d,\n", ls_compress_level());
     if (p->bytes_raw > 0 && total > 0) {
         fprintf(f, "  \"throughput_mbps\": %.1f,\n",
                 (double)p->bytes_wire / 1048576.0 / ((double)total / 1000.0));
     }
     fprintf(f, "  \"phases\": [\n");
+    int need_other = (other > 0);
     for (int i = 0; i < p->n; i++) {
         char esc[384];
         json_escape(p->v[i].detail, esc, sizeof(esc));
+        int last = (i + 1 == p->n) && !need_other;
         fprintf(f, "    {\"name\": \"%s\", \"ms\": %llu, \"pct\": %.1f, \"detail\": \"%s\"}%s\n",
                 p->v[i].name, (unsigned long long)p->v[i].ms,
                 total ? 100.0 * (double)p->v[i].ms / (double)total : 0.0, esc,
-                i + 1 < p->n ? "," : "");
+                last ? "" : ",");
     }
-    if (other > 0) {
+    if (need_other) {
         fprintf(f, "    {\"name\": \"other\", \"ms\": %llu, \"pct\": %.1f, \"detail\": \"\"}\n",
                 (unsigned long long)other, 100.0 * (double)other / (double)total);
     }
@@ -1548,6 +1557,44 @@ void ls_sink_free(LsSink *s)
 
 /* ======================= bundle 传输 ======================= */
 
+static int g_zlevel = LS_COMPRESS_LEVEL;
+
+void ls_set_compress_level(int lv)
+{
+    if (lv < 1) {
+        lv = 1;
+    }
+    if (lv > 9) {
+        lv = 9;
+    }
+    g_zlevel = lv;
+}
+
+int ls_compress_level(void)
+{
+    return g_zlevel;
+}
+
+double ls_cfg_get(const char *json, const char *key, double def)
+{
+    if (!json || !key) {
+        return def;
+    }
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(json, pat);
+    if (!p) {
+        return def;
+    }
+    p += strlen(pat);
+    while (*p == ' ' || *p == ':' || *p == '\t') {
+        p++;
+    }
+    char *end = NULL;
+    double v = strtod(p, &end);
+    return end == p ? def : v;
+}
+
 int ls_should_compress(const char *root, const BundleEntry *ents, size_t n, int mode)
 {
     if (mode == LS_COMPRESS_ON) {
@@ -1602,7 +1649,7 @@ int ls_send_bundle(int fd, const char *root, const BundleEntry *ents, size_t n, 
      * 只有 ~50 MB/s，会把网络晾着；level 1 有 ~150 MB/s，压缩不再是瓶颈，
      * 压缩率只差几个百分点。
      */
-    if (compress && deflateInit(&zs, LS_COMPRESS_LEVEL) == Z_OK) {
+    if (compress && deflateInit(&zs, g_zlevel) == Z_OK) {
         zok = 1;
         zbuf = (uint8_t *)malloc(LS_CHUNK);
         if (!zbuf) {
@@ -1795,6 +1842,7 @@ int ls_send_bundle(int fd, const char *root, const BundleEntry *ents, size_t n, 
         ls_dbg("压缩：%llu -> %llu 字节（%.0f%%）", (unsigned long long)total,
                (unsigned long long)wire, 100.0 * (double)wire / (double)total);
     }
+    prof_add_bytes(total, wire);
     if (local_failed > 0) {
         ls_log("本端有 %u 个文件读不了，例如：%s", local_failed,
                first_local_err[0] ? first_local_err : "(未知)");
@@ -1871,6 +1919,7 @@ int ls_recv_bundle_body(int fd, const Buf *begin, LsSinkFactory mk, void *ctx,
 
     uint32_t ok = 0, failed = 0;
     uint64_t total = 0;
+    uint64_t wire_in = 0;
     uint32_t seen = 0;
     LsSink *cur = NULL;
     int cur_failed = 0;
@@ -1991,6 +2040,7 @@ int ls_recv_bundle_body(int fd, const Buf *begin, LsSinkFactory mk, void *ctx,
 
         if (t == MSG_BUNDLE_DATA) {
             if (cur || zok) {
+                wire_in += b.len;
                 if (zok) {
                     zs.next_in = b.p;
                     zs.avail_in = (uInt)b.len;
@@ -2094,6 +2144,8 @@ ack:
         }
         progress_end(buf);
     }
+
+    prof_add_bytes(total, wire_in);
 
     if (ok_n) {
         *ok_n = ok;

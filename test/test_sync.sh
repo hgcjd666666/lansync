@@ -45,8 +45,8 @@ start_server() {   # start_server <dir> [额外参数...]
     RUN=$((RUN + 1))
     LASTLOG="$WORK/server-$RUN.log"
     LASTCLIENT="$WORK/client-$RUN.log"
-    "$BIN" server -d "$dir" -p "$PORT" -w "$UDPPORT" -n testsrv --no-announce "$@" \
-        >"$LASTLOG" 2>&1 &
+    "$BIN" server -d "$dir" -p "$PORT" -w "$UDPPORT" -n testsrv --no-announce \
+        --config "$WORK/prof.json" "$@" >"$LASTLOG" 2>&1 &
     SRV_PID=$!
     sleep 0.4
     if ! kill -0 "$SRV_PID" 2>/dev/null; then

@@ -39,6 +39,8 @@ typedef struct {
 static int g_ignore_version = 0;
 /* 本机文件系统能否保留 mtime；不能就只能按大小比对 */
 static int g_mtime_ok = 1;
+/* 剖析/配置文件路径；NULL 表示用默认名 */
+static const char *g_profile_path = NULL;
 
 /* ---------------- 局域网发现 ---------------- */
 
@@ -754,6 +756,10 @@ int client_main(int argc, char **argv)
     ls_log("已连接 %s:%u", server_ip, server_port);
 
     int rc = 0;
+    Profile prof;
+    prof_init(&prof, "client", root, server_ip);
+    prof_bind(&prof);
+
     FileList local;
     flist_init(&local);
     Buf b;
@@ -878,21 +884,29 @@ int client_main(int argc, char **argv)
         uint64_t t0 = ls_now_ms();
         char err[512];
         ls_log("正在扫描本地目录…");
+        prof_begin("scan");
         if (fs_scan(root, &local, err, sizeof(err)) != 0) {
+            prof_end("失败");
             ls_log("扫描失败：%s", err);
             rc = 1;
             goto out;
         }
         ls_log("扫描完成：%zu 个文件，耗时 %llu ms", local.n,
                (unsigned long long)(ls_now_ms() - t0));
+        prof_end("%zu 个文件", local.n);
+
+        prof_begin("list_out");
         if (send_list(fd, &local) != 0) {
+            prof_end("失败");
             ls_log("上报清单失败");
             rc = 1;
             goto out;
         }
+        prof_end(NULL);
     }
 
     /* 6. 按服务端指令完成一次同步 */
+    prof_begin("wait"); /* 等服务端的指令（判定在服务端做） */
     for (;;) {
         buf_init(&b);
         uint8_t t = 0;
@@ -934,6 +948,7 @@ int client_main(int argc, char **argv)
         }
 
         if (t == MSG_BUNDLE_BEGIN) {
+            prof_begin("recv");
             SinkCtx sc;
             memset(&sc, 0, sizeof(sc));
             sc.root = root;
@@ -950,6 +965,7 @@ int client_main(int argc, char **argv)
             stats.pulled += okn;
             stats.failed += failn;
             stats.bytes += bytes;
+            prof_end("%u 个文件", okn);
             continue;
         }
 
@@ -1027,6 +1043,8 @@ int client_main(int argc, char **argv)
 
 out:
     flist_free(&local);
+    prof_finish(&prof, g_profile_path);
+    prof_bind(NULL);
     close(fd);
     return rc;
 }
