@@ -806,18 +806,27 @@ static void *udp_thread(void *arg)
         int pr = poll(&pfd, 1, 400);
         if (pr > 0 && (pfd.revents & POLLIN)) {
             char buf[LS_PATHMAX + 256];
-            struct sockaddr_in from;
-            socklen_t fl = sizeof(from);
-            ssize_t n = recvfrom(fd, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&from, &fl);
+            char from_ip[INET_ADDRSTRLEN] = "?";
+            uint16_t from_port = 0;
+            int ifindex = 0;
+            ssize_t n = ls_udp_recv_from(fd, buf, sizeof(buf) - 1, from_ip,
+                                         sizeof(from_ip), &from_port, &ifindex);
             if (n > 0) {
                 buf[n] = '\0';
                 if (strncmp(buf, "LANDSYNC_DISCOVER", 17) == 0) {
                     char reply[LS_PATHMAX + 128];
                     int m = snprintf(reply, sizeof(reply), "LANDSYNC_OFFER %u\n%s\n%s\n",
                                      g_port, g_name, g_root);
-                    int sr = sendto(fd, reply, (size_t)m, 0, (struct sockaddr *)&from, fl);
-                    char ip[INET_ADDRSTRLEN] = "?";
-                    inet_ntop(AF_INET, &from.sin_addr, ip, sizeof(ip));
+                    /*
+                     * 从收到请求的那个接口回复（ifindex）。
+                     * 不能让它重新查路由：手机上开着 VPN 时，到同网段设备的路由
+                     * 会被劫持到 tun0（实测 `ip route get 192.168.0.13` 给出
+                     * `dev tun0 table 1076`），包从梯子出去，客户端永远收不到，
+                     * 而 sendto 照样返回成功、日志一切正常。
+                     */
+                    int sr = ls_udp_send_to(fd, reply, (size_t)m, from_ip, from_port,
+                                            ifindex);
+                    const char *ip = from_ip;
                     /*
                      * 这里用 ls_log 而不是 ls_dbg：release 版里 ls_dbg 是
                      * ((void)0)，整个消失。「客户端说发现不到服务端」时，
@@ -848,11 +857,17 @@ static void *udp_thread(void *arg)
                         }
                         snprintf(seen_ip[slot], sizeof(seen_ip[slot]), "%s", ip);
                         seen_ms[slot] = nowms;
+                        /*
+                         * ls_dbg：release 版里整个消失，只有 -DLS_DEBUG 的构建
+                         * 才打得出来。发现出问题时换 Android 调试版跑。
+                         */
+                        (void)sr;
                         if (sr < 0) {
-                            ls_log("收到来自 %s 的发现请求，但回复失败：%s", ip,
+                            ls_dbg("收到来自 %s 的发现请求，但回复失败：%s", ip,
                                    strerror(errno));
                         } else {
-                            ls_log("收到来自 %s 的发现请求，已回复（TCP 端口 %u）", ip, g_port);
+                            ls_dbg("收到来自 %s 的发现请求，已从接口 %d 回复（TCP 端口 %u）",
+                                   ip, ifindex, g_port);
                         }
                     }
                 }

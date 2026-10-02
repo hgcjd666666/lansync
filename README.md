@@ -8,13 +8,25 @@
 ## 构建
 
 ```bash
-make            # 本机 Linux 版      -> build/lansync
-make android    # Android arm64 版   -> build/lansync-android-arm64
-make test       # 端到端测试（21 项）
+make            # Linux 调试版 + Android 发布版 + Android 调试版
+make android    # 只出 Android 的两个版本
+make test       # 端到端测试
+make test-hash  # 校验 third_party 里的 gxhash 与上游一致
 ```
 
-Android 版用 `--target=aarch64-linux-android21`，动态链接，只依赖 `libc.so`/`libdl.so`，
-66 KB，不需要 root：
+产出：
+
+| 产物 | 说明 |
+|---|---|
+| `build/lansync_d` | Linux 调试版（本机跑测试用） |
+| `build/lansync-android-arm64` | Android 发布版：strip + upx，不含任何诊断输出 |
+| `build/lansync-android-arm64-d` | Android 调试版：带 `-DLS_DEBUG`，不 strip 不 upx |
+
+**排除故障要用带 `-d` 后缀的调试版**。发布版里 `ls_dbg` 展开成 `((void)0)`，
+连参数字符串都不会进二进制——发现请求、判定细节这类输出全都没有。
+
+Android 版用 `--target=aarch64-linux-android21`，动态链接，只依赖
+`libc.so`/`libdl.so`/`libm.so`/`libz.so`，不需要 root：
 
 ```bash
 adb push build/lansync-android-arm64 /data/local/tmp/lansync
@@ -179,6 +191,7 @@ TCP 单连接，服务端驱动；消息 = `type(1B) + 长度(4B 大端) + 载�
 ## 局域网发现失败怎么查
 
 客户端不带 `-s` 时会发 UDP 广播找服务端。这条路出问题时，两端都有东西可看。
+**服务端要用调试版**（`lansync-android-arm64-d`）跑，发布版里没有这些输出。
 
 **客户端**（`discover` 或 `client` 的日志）会打印广播实际发往的地址，带接口名：
 
@@ -189,22 +202,44 @@ TCP 单连接，服务端驱动；消息 = `type(1B) + 长度(4B 大端) + 载�
 这一行就是第一道判断：
 
 - **里面没有服务端所在网段** → 发送端的问题。手机接口多
-  （wlan0/ap0/bt-pan/ccmni\*），广播发错网段就等于没发。确认 Wi-Fi 连着、
+  （wlan0/ap0/bt-pan/ccmni\*），广播发错网段就等于没发。确认 Wi-Fi/热点连着、
   且那个接口有 IPv4 地址。
 - **地址对了还是收不到** → 去看服务端。
 
-**服务端**收到发现请求会记一条（release 版也记，这不是调试输出）：
+**服务端**（调试版）收到发现请求会记一条：
 
 ```
-[06:39:00.440] INFO 收到来自 192.168.0.42 的发现请求，已回复（TCP 端口 9527）
+[06:56:16.219] DBG 收到来自 192.168.0.42 的发现请求，已从接口 40 回复（TCP 端口 9527）
 ```
 
-- **有这条** → 请求到了、也回了，问题在回程（客户端侧防火墙等）。
+- **有这条** → 请求到了、也回了，问题在回程。
 - **没这条** → 广播根本没到服务端：不在同一网段、路由器开了 AP 隔离，或者
   服务端压根没在跑。**`discover` 必须在服务端开着的时候跑**，否则必然
   “没有发现任何服务端”。
 
-服务端日志按源 IP 各自限频 5 秒，一个客户端有多个接口时不会刷屏。
+（这条按源 IP 各自限频 5 秒，一个客户端有多个接口时不会刷屏。）
+
+### 开着 VPN/梯子时自动发现会失效（已修）
+
+实际踩到过的坑，症状很迷惑人：
+
+- `client -s 服务端IP` **完全正常**（TCP 能连、能同步，一路跑完）
+- 自动发现却**永远失败**，客户端一条应答都收不到
+- 服务端日志显示收到请求、也回复了，`sendto` 返回成功、毫无错误
+
+根因是**无连接的 UDP 每次收发都要重查路由表**，而开着梯子时到同一个 Wi-Fi 里
+其他设备的流量会被 VPN 的路由规则劫持：
+
+```
+$ ip route get 192.168.0.13
+192.168.0.13 dev tun0 table 1076 src 10.255.0.1     ← 本该走 wlan0
+```
+
+于是回复包从 VPN 出去，永远到不了客户端。TCP 不受影响，因为它**走的是已建立
+连接绑定的那个 socket，不重查路由**——这正好解释了上面「TCP 行、UDP 不行」的怪现象。
+
+现在收到请求时会把入接口记下来（`IP_PKTINFO`），回复指定从**同一个接口**出去，
+不再重新查路由；广播发送也按接口指定。开着梯子也能自动发现。
 
 实在查不出来就直接 `-s 服务端IP`——发现只是省得记 IP，TCP 那条路完全独立。
 

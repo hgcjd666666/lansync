@@ -62,12 +62,13 @@ ANDROID_BIN_DBG := $(BUILDDIR)/lansync-android-arm64-d
 
 .PHONY: all linux android test test-hash demo clean
 
-# Linux 出调试版，Android 出发布版
-all: $(BIN_DBG) $(ANDROID_BIN)
+# Linux 出调试版；Android 同时出发布版和调试版
+# （发布版不含任何诊断输出，排查发现/连接问题时换调试版跑）
+all: $(BIN_DBG) $(ANDROID_BIN) $(ANDROID_BIN_DBG)
 
 linux: $(BIN_DBG)
 
-android: $(ANDROID_BIN)
+android: $(ANDROID_BIN) $(ANDROID_BIN_DBG)
 
 # ---------------- Linux 调试版 ----------------
 
@@ -102,12 +103,14 @@ $(ANDROID_BIN): $(SRCS) $(HASH_LIB)
 	@$(UPX) -9 -q $@ 2>/dev/null || echo "（upx 跳过，仍是非压缩版）"
 	@echo "android 发布版: $@  (`stat -c%s $@` 字节)"
 
-# ---------------- Android 调试版（当前不需要，保留） ----------------
-#
-# $(ANDROID_BIN_DBG): $(SRCS)
-# 	@mkdir -p $(BUILDDIR)
-# 	$(ANDROID_CLANG) $(ANDROID_FLAGS) $(DEBUG_FLAGS) $(SRCS) -o $@ $(ANDROID_LIBS)
-# 	@echo "android 调试版: $@"
+# ---------------- Android 调试版 ----------------
+# 带 -DLS_DEBUG：诊断输出（发现请求、判定细节等）都在这个版本里，
+# 发布版里它们被编译掉了。不 strip 也不 upx，方便直接看符号和串。
+
+$(ANDROID_BIN_DBG): $(SRCS) $(HASH_LIB)
+	@mkdir -p $(BUILDDIR)
+	$(ANDROID_CLANG) $(ANDROID_FLAGS) $(DEBUG_FLAGS) $(SRCS) -o $@ $(ANDROID_LIBS)
+	@echo "android 调试版: $@  (`stat -c%s $@` 字节)"
 
 # ---------------- 其他 ----------------
 

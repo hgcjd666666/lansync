@@ -943,6 +943,12 @@ int ls_udp_open(uint16_t port, int reuse)
     if (reuse) {
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     }
+    /*
+     * 要 IP_PKTINFO：收到包时才知道它从哪个接口进来，回复才能原路返回。
+     * 开着 VPN 时这一步是关键，见 common.h 里的说明。
+     * 老内核或不支持的平台会失败，那就当没这回事，退化成老行为。
+     */
+    setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &one, sizeof(one));
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof(sa));
     sa.sin_family = AF_INET;
@@ -953,6 +959,88 @@ int ls_udp_open(uint16_t port, int reuse)
         return -1;
     }
     return fd;
+}
+
+ssize_t ls_udp_recv_from(int fd, void *buf, size_t n, char *from_ip, size_t ipcap,
+                         uint16_t *from_port, int *ifindex)
+{
+    struct sockaddr_in from;
+    memset(&from, 0, sizeof(from));
+    struct iovec iov;
+    iov.iov_base = buf;
+    iov.iov_len = n;
+    char cbuf[CMSG_SPACE(sizeof(struct in_pktinfo))];
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_name = &from;
+    msg.msg_namelen = sizeof(from);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cbuf;
+    msg.msg_controllen = sizeof(cbuf);
+
+    ssize_t r = recvmsg(fd, &msg, 0);
+    if (r < 0) {
+        return r;
+    }
+    if (from_ip && ipcap) {
+        if (!inet_ntop(AF_INET, &from.sin_addr, from_ip, ipcap)) {
+            snprintf(from_ip, ipcap, "?");
+        }
+    }
+    if (from_port) {
+        *from_port = ntohs(from.sin_port);
+    }
+    if (ifindex) {
+        *ifindex = 0;
+        for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c != NULL; c = CMSG_NXTHDR(&msg, c)) {
+            if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_PKTINFO) {
+                struct in_pktinfo pi;
+                memcpy(&pi, CMSG_DATA(c), sizeof(pi));
+                *ifindex = pi.ipi_ifindex;
+                break;
+            }
+        }
+    }
+    return r;
+}
+
+int ls_udp_send_to(int fd, const void *buf, size_t n, const char *ip, uint16_t port,
+                   int ifindex)
+{
+    struct sockaddr_in to;
+    memset(&to, 0, sizeof(to));
+    to.sin_family = AF_INET;
+    to.sin_port = htons(port);
+    if (inet_pton(AF_INET, ip, &to.sin_addr) != 1) {
+        return -1;
+    }
+
+    struct iovec iov;
+    iov.iov_base = (void *)buf;
+    iov.iov_len = n;
+    char cbuf[CMSG_SPACE(sizeof(struct in_pktinfo))];
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_name = &to;
+    msg.msg_namelen = sizeof(to);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+
+    if (ifindex > 0) {
+        /* 指定出接口，绕开路由表的接口选择——开着 VPN 时这就是生死的区别 */
+        msg.msg_control = cbuf;
+        msg.msg_controllen = CMSG_SPACE(sizeof(struct in_pktinfo));
+        struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+        c->cmsg_level = IPPROTO_IP;
+        c->cmsg_type = IP_PKTINFO;
+        c->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
+        struct in_pktinfo pi;
+        memset(&pi, 0, sizeof(pi));
+        pi.ipi_ifindex = ifindex;
+        memcpy(CMSG_DATA(c), &pi, sizeof(pi));
+    }
+    return sendmsg(fd, &msg, 0);
 }
 
 /* 把发往的地址记进 detail（逗号分隔，发送失败的加 "!"） */
@@ -992,10 +1080,6 @@ int ls_udp_broadcast(int fd, uint16_t port, const char *text, char *detail,
                      size_t detail_cap)
 {
     size_t len = strlen(text);
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(port);
 
     if (detail && detail_cap) {
         detail[0] = '\0';
@@ -1003,9 +1087,8 @@ int ls_udp_broadcast(int fd, uint16_t port, const char *text, char *detail,
 
     int sent = 0;
 
-    /* 1) 全局广播 */
-    sa.sin_addr.s_addr = htonl(INADDR_BROADCAST);
-    int ok = sendto(fd, text, len, 0, (struct sockaddr *)&sa, sizeof(sa)) >= 0;
+    /* 1) 全局广播（不指定接口，按默认路由走） */
+    int ok = ls_udp_send_to(fd, text, len, "255.255.255.255", port, 0) >= 0;
     if (ok) {
         sent++;
     }
@@ -1013,7 +1096,8 @@ int ls_udp_broadcast(int fd, uint16_t port, const char *text, char *detail,
 
     /* 2) 每个非回环、支持广播的接口，各发一份到其子网广播地址。
      *    不用 getifaddrs（bionic 从 API 24 才有），也不用 /proc/net/dev
-     *    （Android 10+ 普通进程读不到），只用 SIOCGIFCONF，API 21 即可。 */
+     *    （Android 10+ 普通进程读不到），只用 SIOCGIFCONF，API 21 即可。
+     *    发送时带上接口 index：开着 VPN 时只靠路由表选接口会发错地方。 */
     int s = socket(AF_INET, SOCK_DGRAM, 0);
     if (s < 0) {
         return sent;
@@ -1051,15 +1135,21 @@ int ls_udp_broadcast(int fd, uint16_t port, const char *text, char *detail,
         if (br->sin_addr.s_addr == 0) {
             continue;
         }
-        sa.sin_addr = br->sin_addr;
+
+        /* 这个接口的 index，发送时用它把包钉在这个接口上 */
+        struct ifreq ireq;
+        memset(&ireq, 0, sizeof(ireq));
+        snprintf(ireq.ifr_name, IFNAMSIZ, "%s", req.ifr_name);
+        int ifidx = ioctl(s, SIOCGIFINDEX, &ireq) == 0 ? ireq.ifr_ifindex : 0;
+
         char ip[32];
         char addr[64];
-        if (!inet_ntop(AF_INET, &sa.sin_addr, ip, sizeof(ip))) {
+        if (!inet_ntop(AF_INET, &br->sin_addr, ip, sizeof(ip))) {
             snprintf(ip, sizeof(ip), "?");
         }
         /* 带上接口名：发现不到服务端时，一眼能看出 wlan0 到底在不在里面 */
         snprintf(addr, sizeof(addr), "%s(%s)", ip, req.ifr_name);
-        ok = sendto(fd, text, len, 0, (struct sockaddr *)&sa, sizeof(sa)) >= 0;
+        ok = ls_udp_send_to(fd, text, len, ip, port, ifidx) >= 0;
         if (ok) {
             sent++;
         }

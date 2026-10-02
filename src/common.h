@@ -131,6 +131,25 @@ int  ls_tcp_listen(uint16_t port, int backlog);
 int  ls_tcp_connect(const char *host, uint16_t port);
 
 int  ls_udp_open(uint16_t port, int reuse);
+
+/*
+ * 带接口信息的 UDP 收发。
+ *
+ * 为什么需要这层：无连接的 UDP 每次收发都要重查路由表，这在手机上很容易被
+ * VPN 劫持——实测开着梯子时 `ip route get <同网段的手机>` 给出的是
+ * `dev tun0 table 1076 src 10.255.0.1`。于是服务端明明收到了发现请求、
+ * 回复也返回成功，包却从 VPN 出去，同一个 Wi-Fi 里的客户端永远收不到。
+ * （TCP 不受影响：回复走已建立连接绑定的 socket，不重查路由。这正好解释了
+ * 「client -s IP 能连上，自动发现却永远失败」这个现象。）
+ *
+ * 所以收到请求时把入接口记下来（IP_PKTINFO），回复时指定从同一个接口出去。
+ * ifindex <= 0 表示不指定、按常规路由走。
+ */
+ssize_t ls_udp_recv_from(int fd, void *buf, size_t n, char *from_ip, size_t ipcap,
+                         uint16_t *from_port, int *ifindex);
+int     ls_udp_send_to(int fd, const void *buf, size_t n, const char *ip, uint16_t port,
+                       int ifindex);
+
 /*
  * 向各网段的广播地址各发一份，返回实际发出的份数。
  * detail 非 NULL 时把发往的地址写进去（逗号分隔，发送失败的加后缀 "!"）。
