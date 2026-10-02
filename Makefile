@@ -76,6 +76,9 @@ BIN_DBG := $(BUILDDIR)/lansync_d
 
 # Android（精简版 NDK，默认 aarch64-linux-android21）
 # 纯 C 只依赖 bionic 的 libc/libdl/libm/libz（都是系统自带），动态链接即可。
+# Android NDK 的 clang。下面这个只是本机用的「精简 NDK」布局；标准 NDK 通常是
+#   $NDK/toolchains/llvm/prebuilt/<host>/bin/aarch64-linux-android21-clang
+# 不匹配就覆盖掉：make android ANDROID_CLANG=/path/to/clang
 ANDROID_CLANG   ?= /r/ndk-min/bin/android-clang
 ANDROID_FLAGS   := -O2 -Wall -Wextra -std=c11 -D_GNU_SOURCE -pthread \
                    $(SECTION_FLAGS) $(ANDROID_WS_INC)

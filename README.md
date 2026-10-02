@@ -656,51 +656,100 @@ $ ip route get 192.168.0.13
 `gxhash32`）校验 C 接口，见 `test/hash_vectors.c`。这条特别重要 ——
 它钉死了「哈希跨平台稳定」这个前提，换个 `.a` 就能立刻发现。
 
-### `third_party/wolfssl/`
+### 第三方依赖（`third_party/`）
 
-静态库和头文件已经放在仓库里，`make` 直接用，**不需要你另外装 wolfSSL**：
+两个依赖都是**编好的静态库**，已经放在仓库里，`make` 直接用，**不需要你另外装**：
 
 | 路径 | 内容 |
 |---|---|
-| `third_party/wolfssl/android/libwolfssl.a` | Android（bionic）静态库 |
-| `third_party/wolfssl/linux/libwolfssl.a` | Linux（glibc）静态库 |
+| `third_party/wolfssl/<平台>/libwolfssl.a` | wolfSSL（TLS 1.3）；`android` = bionic，`linux` = glibc |
 | `third_party/wolfssl/include/` | 公共头文件（只放了实际用到的那些） |
 | `third_party/wolfssl/<平台>/wolfssl/options.h` | 各平台自己的编译配置 |
+| `third_party/libgxhash_arm64.a` | gxhash 的内容哈希（aarch64） |
 
-两个平台**不能共用同一个 `.a`**（libc 不通用），`options.h` 也随平台差一项
+平时不用重建，只有升级版本、改编译选项、或换 CPU 架构时才需要。下面是重来一遍的做法。
+
+#### wolfSSL
+
+```bash
+git clone https://github.com/wolfSSL/wolfssl.git && cd wolfssl
+
+./configure \
+    --host=aarch64-linux-android \
+    --enable-static --disable-shared \
+    --disable-examples --disable-crypttests \
+    --enable-tls13 \
+    --enable-ed25519 --enable-curve25519 \
+    --enable-chacha --enable-poly1305 \
+    --enable-armasm --enable-asm \
+    --disable-rsa --disable-dh --disable-dsa \
+    --disable-oldtls --disable-sslv3 --disable-tlsv12 \
+    --disable-des3 --disable-arc4 --disable-md5 \
+    CC="$NDK/bin/android-clang" \
+    CFLAGS="-Os -fPIC -ffunction-sections -fdata-sections" \
+    CPPFLAGS="-DHAVE_ED25519_KEY_IMPORT"
+make -j"$(nproc)"
+
+cp src/.libs/libwolfssl.a <项目根>/third_party/wolfssl/android/
+cp wolfssl/options.h      <项目根>/third_party/wolfssl/android/wolfssl/
+```
+
+Linux（glibc）那份是把 `--host` 和 `CC` 去掉、产物放进 `third_party/wolfssl/linux/`。
+两个平台**不能共用一个 `.a`**（libc 不通用），`options.h` 也差一项
 （`WC_RNG_AUTOFORK`），所以头路径按平台分。
 
-库的配置是 `--enable-tls13 --enable-ed25519 --enable-curve25519 --enable-chacha
---enable-poly1305 --enable-armasm --enable-asm`，并关掉了 RSA / DH / DSA / TLS1.2 /
-MD5 / RC4 / DES3；编译带 `-ffunction-sections -fdata-sections`，链接时靠
-`--gc-sections` 按**函数**而不是按 `.o` 裁剪（静态链接默认以 `.o` 为单位，
-一个 `.o` 里几十个函数只要引到一个就全拉进来；实测这一步省约 25%）。
+**两个参数不能漏，都是踩过的**：
 
-> **`--enable-armasm` 不能省（踩过）**：它的帮助里写着 `default: disabled`，
-> 不显式打开就得到一份**纯 C** 的库 —— 功能都对，但 SHA-256 只有 ~190 MiB/s，
-> 打开后是 **1.2–1.6 GiB/s**（差 6 倍以上），TLS 的 ChaCha20/Ed25519/X25519
-> 也一并失去硬件加速。代价是发布版 +42 KB。
->
-> wolfSSL 的 ARM 汇编自带**三级运行时回退**，不需要你替它操心兼容性：
-> `Sha256_SetTransform()` 读 HWCAP 后选择 `Transform_Sha256_Len_crypto_aarch64`
-> （用 `sha256h`）→ `_neon_aarch64` → 纯 C `Transform_Sha256_Len`。
-> 反汇编可以验证三份实现都在二进制里，而 crypto 指令**只**出现在专用的
-> `L_sha256_len_crypto_begin` 段中，公共路径里一条都没有 —— 所以在没有
-> SHA2/AES 扩展的 CPU 上会安静地走回退，而不是 `SIGILL`。
+1. **`CPPFLAGS=-DHAVE_ED25519_KEY_IMPORT`** —— `configure` 只在 `ENABLED_ED25519`
+   还是 `no` 的那条路径上加这个宏，显式传 `--enable-ed25519` 反而会跳过它。
+   缺了它，服务端签名会报 `ASN parsing error`(-140)，而加载证书、发 Certificate
+   前面几步全都正常，极难查。
+2. **`--enable-armasm --enable-asm`** —— 帮助里写着 `default: disabled`。不打开
+   就得到一份纯 C 的库：功能全对，但 SHA-256 只有 ~0.19 GiB/s，打开后是
+   1.2–1.6 GiB/s。它的 ARM 汇编自带**三级运行时回退**（读 HWCAP 后选
+   crypto / NEON / 纯 C），所以在没有 AES 的 CPU 上不会 `SIGILL`。
 
-> **重建库时的坑（踩过）**：wolfSSL 的 `configure` 只在 `ENABLED_ED25519` 还是 `no`
-> 的那条路径上加 `-DHAVE_ED25519_KEY_IMPORT`。显式传 `--enable-ed25519` 反而会跳过它，
-> 于是服务端签名时报 `ASN parsing error, invalid input`（-140），而证书加载、TLS 握手
-> 前面几步全都正常，很难查。重建库时务必手动补上：
->
-> ```
-> CPPFLAGS="-DHAVE_ED25519_KEY_IMPORT"
-> ```
+`-ffunction-sections -fdata-sections` 是为了让链接时的 `--gc-sections` 能按**函数**
+而不是按 `.o` 裁剪（静态链接默认以 `.o` 为单位，一个 `.o` 里几十个函数只要引到一个就
+全拉进来；实测这一步省约 25% 体积）。
 
-> **RPK 走不通（对照结论）**：RPK（RFC 7250 裸公钥）在「Ed25519 + 本版本 wolfSSL」
-> 下是死的 —— 私钥不带公钥时 `Ed25519CheckPubKey()` 会去调 `wc_CertGetPubKey()`，
-> 而那是个硬编码的 X.509 解析器，喂裸 SPKI 必然报同一个 -140。
-> 所以这里用**自签 X.509 证书**而非 RPK。
+**头文件只放了用到的那些**。以后缺哪个，用 `gcc -M` 列依赖再补：
+
+```bash
+printf '#include <wolfssl/options.h>\n#include <wolfssl/ssl.h>\n' > /tmp/probe.c
+gcc -M -Ithird_party/wolfssl/linux -I"$WOLFSSL_SRC" /tmp/probe.c \
+    | tr ' ' '\n' | grep 'wolfssl/.*\.h'
+```
+
+#### gxhash
+
+gxhash 是 Rust 写的，它仓库里自带的 `ffi/` crate 负责导出 C 接口。那个 `staticlib`
+会把整个 Rust std 打进去（20+ MB），但**链接器只要里面含 `gxhash64` 的那一个目标
+文件** —— 所以这里把它抽出来单独打包（5.7 KB；最终二进制只涨 2 KB 多）。
+
+```bash
+git clone https://github.com/ogxd/gxhash.git && cd gxhash/ffi
+
+# gxhash 硬依赖 aes + neon 指令，不满足会直接编译失败（上游明确没有回退）
+RUSTFLAGS="-C target-feature=+aes,+neon" \
+    cargo build --release --target aarch64-unknown-linux-gnu
+
+LIB=target/aarch64-unknown-linux-gnu/release/libgxhash.a
+
+# 找出含 gxhash64 的那个 .o，单独打包
+for o in $(ar t "$LIB"); do
+    ar p "$LIB" "$o" > /tmp/cand.o
+    if nm /tmp/cand.o 2>/dev/null | grep -q ' T gxhash64'; then
+        ar rcs libgxhash_arm64.a /tmp/cand.o
+        break
+    fi
+done
+
+cp libgxhash_arm64.a <项目根>/third_party/
+```
+
+**它只适用于 aarch64**（目标文件架构是固定的）。换别的架构时 `Makefile` 会跳过它，
+`src/hash.c` 退化成「gxhash 不可用」，同步自动改用 SHA3-256（见「内容哈希」一节）。
 
 ### 目录
 
