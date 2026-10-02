@@ -1548,7 +1548,18 @@ static int fsink_finish(LsSink *s)
         return -1;
     }
     fs->tmp[0] = '\0';
-    (void)set_mtime(fs->dst, fs->mtime);
+
+    /*
+     * 把服务端的 mtime 写上去。
+     *
+     * 设不上**不算失败**：内容已经正确落盘了，而客户端启动时探测过自己能不能
+     * 保住 mtime，保不住的话服务端那边本来就改用内容哈希比对了，不会因为时间戳
+     * 是「现在」就反复全量重传。这里只记一笔，别把文件判死。
+     */
+    if (set_mtime(fs->dst, fs->mtime) != 0) {
+        ls_dbg("时间戳没设上 %s: %s（内容已正确落盘，判定会走内容哈希）", fs->dst,
+               strerror(errno));
+    }
     return 0;
 }
 

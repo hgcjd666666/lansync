@@ -424,9 +424,22 @@ static void update_usage(const char *prog, int debug)
 /* ---------------- 探测本机文件系统能否保留 mtime ---------------- */
 
 /*
+ * 自动探测的结果，可能被 --mtime / --no-mtime 覆盖。
+ * 探测不是万无一失的：探针文件写在同步根目录，它的表现未必等于所有文件的
+ * 表现（不同子目录可能挂在不同文件系统上、探针的写法也未必触发同样的路径）。
+ * 所以留个手动开关，探测报错时能直接兜住。
+ */
+enum { MTIME_AUTO = 0, MTIME_FORCE_ON = 1, MTIME_FORCE_OFF = 2 };
+
+/*
  * 在同步根目录写一个探针，把 mtime 设成 2020-01-01，再读回来核对。
  * 能设上（哪怕被截断到秒）就算可信；设不上（读回来是「现在」）说明这个
  * 文件系统不支持改时间戳，此时 mtime 比对毫无意义，必须退化。
+ *
+ * 探测分两步看，报错要能分清是哪一步断的：
+ *   utimensat 直接失败  -> 内核/文件系统不允许，这是硬性的
+ *   utimensat 成功但读回不对 -> 文件系统接受了调用却存不住
+ * 两者在日志里要能区分，否则只能看到一句「设不上」而不知道该查什么。
  */
 static int mtime_capable(const char *root)
 {
@@ -447,7 +460,12 @@ static int mtime_capable(const char *root)
     fputs("probe", f);
     fclose(f);
 
-    (void)set_mtime(probe, want);
+    int rc = set_mtime(probe, want);
+    if (rc != 0) {
+        ls_dbg("mtime 探针：utimensat 直接失败（%s），本机改不了文件时间戳", strerror(errno));
+        unlink(probe);
+        return 0;
+    }
 
     int ok = 1;
     struct stat st;
@@ -458,6 +476,10 @@ static int mtime_capable(const char *root)
             d = -d;
         }
         ok = (d <= LS_MTIME_TOLERANCE_NS);
+        if (!ok) {
+            ls_dbg("mtime 探针：utimensat 成功但读回来是 %lld，设不住（%s）", (long long)got,
+                   root);
+        }
     }
     unlink(probe);
     return ok;
