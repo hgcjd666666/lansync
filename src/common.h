@@ -44,7 +44,10 @@ enum {
     MSG_BUNDLE_DATA  = 19, /* {bytes} 属于上一个 ENTRY 的内容 */
     MSG_BUNDLE_END   = 20, /* {} 一个 bundle 结束 */
     MSG_BUNDLE_ACK   = 21, /* {u8 ok, str msg, u32 done, u32 failed} */
-    MSG_PULL_WANT    = 22  /* S->C {u32 n, [str rel]...} 服务端要客户端把这些发来 */
+    MSG_PULL_WANT    = 22, /* S->C {u32 n, [str rel]...} 服务端要客户端把这些发来 */
+    MSG_PLAN         = 23  /* S->C {u32 push_files, u64 push_bytes, u32 pull_files,
+                                     u64 pull_bytes} 先告诉客户端要做多少事，
+                                     好让它的进度条贯穿整场同步而不是每块重来 */
 };
 
 /* 单个清单分片的条目上限 */

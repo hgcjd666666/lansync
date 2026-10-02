@@ -737,6 +737,26 @@ int client_main(int argc, char **argv)
             break;
         }
 
+        if (t == MSG_PLAN) {
+            Rd r;
+            rd_init(&r, b.p, b.len);
+            uint32_t pf = rd_u32(&r);
+            uint64_t pb = rd_u64(&r);
+            uint32_t lf = rd_u32(&r);
+            uint64_t lb = rd_u64(&r);
+            buf_free(&b);
+            if (r.err) {
+                continue;
+            }
+            /* 接收侧一条进度条贯穿整场同步 */
+            if (pf > 0 && pb > 0) {
+                progress_begin("接收", pb, pf);
+            } else if (lf > 0 && lb > 0) {
+                progress_begin("发送", lb, lf);
+            }
+            continue;
+        }
+
         if (t == MSG_PULL_WANT) {
             PullStat ps;
             memset(&ps, 0, sizeof(ps));
@@ -810,6 +830,9 @@ int client_main(int argc, char **argv)
             rd_u32(&r); /* ignored：服务端忽略的客户端多余文件数 */
             uint64_t bytes = rd_u64(&r);
             buf_free(&b);
+            if (progress_active()) {
+                progress_end(NULL); /* 擦掉进度行，摘要交给下面的统计日志 */
+            }
             char sz[32];
             fmt_size(bytes, sz, sizeof(sz));
             ls_log("");

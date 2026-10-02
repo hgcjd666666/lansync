@@ -314,6 +314,30 @@ static void pull_batch(Client *c, PlanItem *items, size_t n)
  */
 static void run_plan(Client *c, Plan *plan)
 {
+    /* 先把总量告诉客户端，否则它只能按每个 bundle 各画一次进度条，
+     * 看上去就是「一块一块地反复从 0% 开始」。 */
+    {
+        uint64_t pb = 0, lb = 0;
+        uint32_t pf = 0, lf = 0;
+        for (size_t k = 0; k < plan->n; k++) {
+            if (plan->v[k].act == ACT_PUSH) {
+                pb += plan->v[k].size;
+                pf++;
+            } else if (plan->v[k].act == ACT_PULL) {
+                lb += plan->v[k].size;
+                lf++;
+            }
+        }
+        Buf b;
+        buf_init(&b);
+        buf_put_u32(&b, pf);
+        buf_put_u64(&b, pb);
+        buf_put_u32(&b, lf);
+        buf_put_u64(&b, lb);
+        (void)ls_msg_send(c->fd, MSG_PLAN, &b);
+        buf_free(&b);
+    }
+
     for (size_t i = 0; i < plan->n; i++) {
         if (plan->v[i].act == ACT_DELETE) {
             if (delete_remote(c, plan->v[i].rel, plan->v[i].why) == 0) {
