@@ -55,19 +55,49 @@ WANT_SELF 里报告自己的目标平台，服务端按平台挑 dist。
 - 可选加 `--retry N`。
 - 之所以排最后：见上面「实测结论」第三条。
 
-### E. 压缩还能做什么（只在同步文本/代码时有意义）
+### E. 压缩流化（并行压缩等改动的前置条件）
+
+**现状**：`LsSource`/`LsSink` 有了，但压缩没有落在流层 —— `deflate()`/`inflate()`
+是内联在 bundle 收发循环里的。发送端只用 `LsSource` 读单个文件
+（`ls_send_bundle` 里 `ls_source_file`），接收端用 `LsSinkFactory` 分发到各 sink。
+
+**为什么难**：一批文件**共享一个 deflate 流**（压缩率靠窗口跨文件复用），
+而 `LsSource` 是每文件一个，单文件的装饰器表达不了「跨条目的流」。
+缺的不是装饰器，是**把「批」本身变成流**：
+
+```c
+// 发送
+LsSource *batch = ls_source_batch(root, ents, n);   // 一批文件 = 一条字节流
+LsSource *z     = ls_source_deflate(batch, level);  // 装饰器，内部一个 deflate 流
+while ((got = z->read(z, buf, LS_CHUNK)) > 0) emit_data(buf, got);
+
+// 接收
+LsSink *split = ls_sink_splitter(mk, ctx);          // 按 ENTRY.size 往下传
+LsSink *z     = ls_sink_inflate(split);
+z->write(z, data, n);
+```
+
+`Z_SYNC_FLUSH` 保条目边界那套要保留（接收端靠 `ENTRY.size` 切分），
+但它属于 `ls_source_batch` 的职责，不再是压缩的事。
+
+**收益**：落点收敛到单个流实现 —— 换 zstd/lz4、并行压缩、按条目决定压不压、
+加加密，都只动一层。**代价**：`ls_send_bundle`/`ls_recv_bundle_body` 的核心循环
+要重写，61 项测试得全跑一遍核对（同样的压缩结果、同样的边界）。
+
+**先做这个，再谈下面两件。**
+
+### E2. 压缩的后续优化（只在同步文本/代码时有意义）
 
 已完成：bundle 级 deflate（整批一个流，条目间 `Z_SYNC_FLUSH` 保边界）、
 auto 模式按采样熵决定、`--compress auto|on|off`。实测 7 MB → 2 MB（29%）。
 
-剩下两件都只对低熵内容有价值：
-
 - **并行压缩**：现在读文件、压缩、写 socket 在同一个线程里串行，同步文本时
   CPU 会挡住网络（zlib level 1 约 50 MB/s，网络实测 37 MB/s，量级相当）。
-  **流抽象已经把这件难事变简单了**：压缩本来就是套在 `LsSource` 上的一层，
-  要并行只需在那个实现内部加一个生产者线程 + 带背压的缓冲，
-  协议、传输层、判定逻辑一行都不用动。
-- **按条目而非整批决定**：现在一批里混了高熵文件也会跟着一起压。
+  流化之后只需在 `ls_source_deflate` 内部加生产者线程 + 带背压的缓冲。
+- **按条目而非整批决定**：现在一批里混了高熵文件也会跟着一起压，
+  而且判定粒度是**整批按平均熵**（`ls_should_compress` 抽 ≤32 个文件各采样 8 KiB）。
+  同步音乐时这个粒度恰好判对（压缩率 100%，auto 判不压），但混合内容时太粗。
+  流化之后由 `ls_sink_splitter` 在条目边界换流即可。
 
 同步音乐时这两件都不用做 —— auto 根本不启动压缩。
 
