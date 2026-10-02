@@ -677,6 +677,7 @@ static void udp_announce(int fd)
     char msg[LS_PATHMAX + 128];
     snprintf(msg, sizeof(msg), "LANDSYNC_ANNOUNCE %u\n%s\n%s\n", g_port, g_name, g_root);
     int n = ls_udp_broadcast(fd, g_udp_port, msg);
+    (void)n; /* release 版里下一行的 ls_dbg 会消失，n 就没人用了 */
     ls_dbg("已向 %d 个广播地址发出 ANNOUNCE", n);
 }
 

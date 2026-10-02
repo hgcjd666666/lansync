@@ -260,6 +260,194 @@ int progress_active(void)
     return g_prog_active;
 }
 
+/* ======================= 性能剖析 ======================= */
+
+static __thread Profile *g_prof = NULL;
+
+void prof_bind(Profile *p)
+{
+    g_prof = p;
+}
+
+Profile *prof_current(void)
+{
+    return g_prof;
+}
+
+void prof_init(Profile *p, const char *role, const char *dir, const char *peer)
+{
+    memset(p, 0, sizeof(*p));
+    p->t_start = ls_now_ms();
+    snprintf(p->role, sizeof(p->role), "%s", role ? role : "?");
+    snprintf(p->dir, sizeof(p->dir), "%s", dir ? dir : "");
+    snprintf(p->peer, sizeof(p->peer), "%s", peer ? peer : "");
+    p->active = 1;
+}
+
+void prof_begin(const char *name)
+{
+    Profile *p = g_prof;
+    if (!p || !p->active) {
+        return;
+    }
+    p->cur_name = name;
+    p->t_phase = ls_now_ms();
+}
+
+void prof_end(const char *detail_fmt, ...)
+{
+    Profile *p = g_prof;
+    if (!p || !p->active || !p->cur_name) {
+        return;
+    }
+    uint64_t ms = ls_now_ms() - p->t_phase;
+
+    /* 同名阶段累加（比如多批传输） */
+    ProfPhase *ph = NULL;
+    for (int i = 0; i < p->n; i++) {
+        if (strcmp(p->v[i].name, p->cur_name) == 0) {
+            ph = &p->v[i];
+            break;
+        }
+    }
+    if (!ph) {
+        if (p->n >= PROF_MAX_PHASES) {
+            p->cur_name = NULL;
+            return;
+        }
+        ph = &p->v[p->n++];
+        ph->name = p->cur_name;
+        ph->ms = 0;
+        ph->detail[0] = '\0';
+    }
+    ph->ms += ms;
+
+    if (detail_fmt) {
+        char tmp[192];
+        va_list ap;
+        va_start(ap, detail_fmt);
+        vsnprintf(tmp, sizeof(tmp), detail_fmt, ap);
+        va_end(ap);
+        snprintf(ph->detail, sizeof(ph->detail), "%s", tmp);
+    }
+    p->cur_name = NULL;
+}
+
+void prof_add_bytes(uint64_t raw, uint64_t wire)
+{
+    Profile *p = g_prof;
+    if (!p || !p->active) {
+        return;
+    }
+    p->bytes_raw += raw;
+    p->bytes_wire += wire;
+}
+
+static void json_escape(const char *in, char *out, size_t cap)
+{
+    size_t k = 0;
+    for (const char *s = in; *s && k + 8 < cap; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\') {
+            out[k++] = '\\';
+            out[k++] = (char)c;
+        } else if (c < 0x20) {
+            k += (size_t)snprintf(out + k, cap - k, "\\u%04x", c);
+        } else {
+            out[k++] = (char)c;
+        }
+    }
+    out[k] = '\0';
+}
+
+void prof_finish(Profile *p, const char *path)
+{
+    if (!p || !p->active) {
+        return;
+    }
+    if (p->cur_name) {
+        prof_end(NULL);
+    }
+    uint64_t total = ls_now_ms() - p->t_start;
+
+    /* 找瓶颈 */
+    const ProfPhase *worst = NULL;
+    uint64_t accounted = 0;
+    for (int i = 0; i < p->n; i++) {
+        accounted += p->v[i].ms;
+        if (!worst || p->v[i].ms > worst->ms) {
+            worst = &p->v[i];
+        }
+    }
+    uint64_t other = total > accounted ? total - accounted : 0;
+
+    char summary[512];
+    if (worst && total > 0) {
+        char d[32], w[32];
+        fmt_size(p->bytes_raw, d, sizeof(d));
+        fmt_size(p->bytes_wire, w, sizeof(w));
+        snprintf(summary, sizeof(summary),
+                 "耗时 %llu ms，瓶颈是「%s」占 %.0f%%；传输 %s（线上 %s）", 
+                 (unsigned long long)total, worst->name,
+                 100.0 * (double)worst->ms / (double)total, d, w);
+    } else {
+        snprintf(summary, sizeof(summary), "耗时 %llu ms（无分阶段数据）",
+                 (unsigned long long)total);
+    }
+    ls_log("性能：%s", summary);
+
+    char outpath[LS_PATHMAX];
+    if (path && *path) {
+        snprintf(outpath, sizeof(outpath), "%s", path);
+    } else {
+        snprintf(outpath, sizeof(outpath), "lansync-profile-%s.json", p->role);
+    }
+
+    FILE *f = fopen(outpath, "w");
+    if (!f) {
+        ls_log("剖析结果写不出去：%s (%s)", outpath, strerror(errno));
+        p->active = 0;
+        return;
+    }
+
+    char esc_dir[LS_PATHMAX * 2], esc_peer[256];
+    json_escape(p->dir, esc_dir, sizeof(esc_dir));
+    json_escape(p->peer, esc_peer, sizeof(esc_peer));
+
+    fprintf(f, "{\n");
+    fprintf(f, "  \"role\": \"%s\",\n", p->role);
+    fprintf(f, "  \"version\": \"%s\",\n", ls_version());
+    fprintf(f, "  \"build\": \"%s\",\n", ls_build_date());
+    fprintf(f, "  \"dir\": \"%s\",\n", esc_dir);
+    fprintf(f, "  \"peer\": \"%s\",\n", esc_peer);
+    fprintf(f, "  \"total_ms\": %llu,\n", (unsigned long long)total);
+    fprintf(f, "  \"bytes_raw\": %llu,\n", (unsigned long long)p->bytes_raw);
+    fprintf(f, "  \"bytes_wire\": %llu,\n", (unsigned long long)p->bytes_wire);
+    fprintf(f, "  \"bottleneck\": \"%s\",\n", worst ? worst->name : "");
+    if (p->bytes_raw > 0 && total > 0) {
+        fprintf(f, "  \"throughput_mbps\": %.1f,\n",
+                (double)p->bytes_wire / 1048576.0 / ((double)total / 1000.0));
+    }
+    fprintf(f, "  \"phases\": [\n");
+    for (int i = 0; i < p->n; i++) {
+        char esc[384];
+        json_escape(p->v[i].detail, esc, sizeof(esc));
+        fprintf(f, "    {\"name\": \"%s\", \"ms\": %llu, \"pct\": %.1f, \"detail\": \"%s\"}%s\n",
+                p->v[i].name, (unsigned long long)p->v[i].ms,
+                total ? 100.0 * (double)p->v[i].ms / (double)total : 0.0, esc,
+                i + 1 < p->n ? "," : "");
+    }
+    if (other > 0) {
+        fprintf(f, "    {\"name\": \"other\", \"ms\": %llu, \"pct\": %.1f, \"detail\": \"\"}\n",
+                (unsigned long long)other, 100.0 * (double)other / (double)total);
+    }
+    fprintf(f, "  ]\n}\n");
+    fclose(f);
+
+    ls_log("剖析结果已写入 %s", outpath);
+    p->active = 0;
+}
+
 /* ======================= 版本 ======================= */
 
 const char *ls_version(void)
@@ -345,11 +533,11 @@ const char *ls_last_error(void)
 /* ======================= 日志 ======================= */
 
 static int g_quiet = 0;
+#ifdef LS_DEBUG
 static int g_verbose = 0;
+#endif
 
 void ls_set_quiet(int q) { g_quiet = q; }
-void ls_set_verbose(int v) { g_verbose = v; }
-int  ls_verbose(void) { return g_verbose; }
 
 static void logv(const char *tag, const char *fmt, va_list ap)
 {
@@ -385,6 +573,10 @@ void ls_log(const char *fmt, ...)
     va_end(ap);
 }
 
+#ifdef LS_DEBUG
+void ls_set_verbose(int v) { g_verbose = v; }
+int  ls_verbose(void) { return g_verbose; }
+
 void ls_dbg(const char *fmt, ...)
 {
     if (!g_verbose) {
@@ -395,6 +587,7 @@ void ls_dbg(const char *fmt, ...)
     logv("DBG ", fmt, ap);
     va_end(ap);
 }
+#endif /* LS_DEBUG */
 
 uint64_t ls_now_ms(void)
 {

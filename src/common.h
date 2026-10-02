@@ -266,11 +266,62 @@ uint64_t    ls_build_ts(void);   /* 编译时刻，Unix 秒，用于比对 */
 /* "lansync 1.0 (built 2025-10-02 03:47:53)" */
 const char *ls_build_info(void);
 
+/* ---------------- 性能剖析 ---------------- */
+
+/*
+ * 分阶段计时，结束时找出最耗时的环节并写成 JSON。
+ * 目的是回答「这次同步到底卡在哪」——扫描、判定、压缩还是传输。
+ */
+#define PROF_MAX_PHASES 16
+
+typedef struct {
+    const char *name;
+    uint64_t    ms;
+    char        detail[192];
+} ProfPhase;
+
+typedef struct {
+    int         active;
+    int         n;
+    ProfPhase   v[PROF_MAX_PHASES];
+    const char *cur_name;
+    uint64_t    t_phase;
+    uint64_t    t_start;
+    uint64_t    bytes_raw;   /* 传输的原始字节 */
+    uint64_t    bytes_wire;  /* 实际线上字节（压缩后） */
+    char        role[16];    /* server / client */
+    char        peer[64];
+    char        dir[LS_PATHMAX];
+    char        note[256];
+} Profile;
+
+/* 绑定一个剖析器到当前线程（传 NULL 解除）。未绑定时所有打点都是空操作。 */
+void prof_bind(Profile *p);
+Profile *prof_current(void);
+void prof_init(Profile *p, const char *role, const char *dir, const char *peer);
+void prof_begin(const char *name);
+void prof_end(const char *detail_fmt, ...);
+void prof_add_bytes(uint64_t raw, uint64_t wire);
+/* 打印一句瓶颈结论，并把 JSON 写到 path；path 为 NULL 时用默认名 */
+void prof_finish(Profile *p, const char *path);
+
 /* ---------------- 日志 ---------------- */
+
+/*
+ * ls_dbg 只在 -DLS_DEBUG 的构建里存在。release 版它展开成 ((void)0)，
+ * 连参数字符串都不会进二进制——调试代码真正被排除，而不是运行时判断。
+ */
 void ls_set_quiet(int q);
+void ls_log(const char *fmt, ...);
+
+#ifdef LS_DEBUG
 void ls_set_verbose(int v);
 int  ls_verbose(void);
-void ls_log(const char *fmt, ...);
 void ls_dbg(const char *fmt, ...);
+#else
+#define ls_set_verbose(v) ((void)0)
+#define ls_verbose()      0
+#define ls_dbg(...)       ((void)0)
+#endif
 
 #endif /* LANSYNC_COMMON_H */

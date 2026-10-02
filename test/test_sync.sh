@@ -8,7 +8,7 @@
 # 用法: bash test/test_sync.sh      或      make test
 set -u
 
-BIN=${BIN:-$(cd "$(dirname "$0")/.." && pwd)/build/lansync}
+BIN=${BIN:-$(cd "$(dirname "$0")/.." && pwd)/build/lansync_d}
 [ -x "$BIN" ] || { echo "找不到可执行文件 $BIN，先执行 make"; exit 1; }
 
 PORT=${PORT:-19727}
