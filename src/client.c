@@ -131,8 +131,14 @@ static int discover_all(OfferList *out, uint16_t udp_port, int timeout_ms,
     if (sent <= 0) {
         ls_log("UDP 广播一个都没发出去：%s", strerror(errno));
     }
+    /*
+     * verbose 只有 discover 子命令会开——它是诊断工具，这行输出是它的「功能」，
+     * 要留着。client 同步时走 ls_dbg，发布版里不出现。
+     */
     if (verbose) {
         ls_log("广播已发往 %d 个地址：%s", sent, where[0] ? where : "(一个都没发出去)");
+    } else {
+        ls_dbg("广播已发往 %d 个地址：%s", sent, where[0] ? where : "(一个都没发出去)");
     }
 
     uint64_t deadline = ls_now_ms() + (uint64_t)timeout_ms;
@@ -194,7 +200,7 @@ static int connect_any(const OfferList *cands, Offer *chosen)
             return fd;
         }
         if (cands->n > 1) {
-            ls_log("  连不上 %s:%u（%s），试下一个", cands->v[i].ip, cands->v[i].port,
+            ls_dbg("  连不上 %s:%u（%s），试下一个", cands->v[i].ip, cands->v[i].port,
                    strerror(errno));
         }
     }
@@ -797,12 +803,13 @@ int client_main(int argc, char **argv)
     } else {
         ls_log("正在局域网内搜索服务端（UDP %u，最多等 %d ms）…", udp_port, timeout_ms);
         OfferList cands;
-        if (discover_all(&cands, udp_port, timeout_ms, server_name, 1) <= 0) {
+        /* 最后那个 0：同步时不打广播地址这类诊断，要看得用调试版或 discover 子命令 */
+        if (discover_all(&cands, udp_port, timeout_ms, server_name, 0) <= 0) {
             ls_log("没找到服务端。请确认服务端已启动，或用 -s 直接指定 IP。");
             return 1;
         }
         for (int i = 0; i < cands.n; i++) {
-            ls_log("  应答 %s:%u  服务端「%s」目录 %s", cands.v[i].ip, cands.v[i].port,
+            ls_dbg("  应答 %s:%u  服务端「%s」目录 %s", cands.v[i].ip, cands.v[i].port,
                    cands.v[i].name, cands.v[i].root);
         }
         Offer chosen;
