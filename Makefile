@@ -8,6 +8,12 @@
 
 CC        ?= gcc
 CFLAGS    ?= -O2 -Wall -Wextra -std=c11 -D_GNU_SOURCE
+
+# 编译时刻，注入二进制：两端握手时比对它，不同就要求更新。
+# 注意用 := 立即求值，且没有源文件改动时不会重新编译，所以它稳定反映「这份二进制何时编的」。
+BUILD_TS   := $(shell date +%s)
+BUILD_DATE := $(shell date '+%Y-%m-%d %H:%M:%S')
+CFLAGS     += -DLS_BUILD_TS=$(BUILD_TS) -DLS_BUILD_DATE='"$(BUILD_DATE)"'
 LDLIBS    ?= -pthread -lm
 
 SRCDIR    := src

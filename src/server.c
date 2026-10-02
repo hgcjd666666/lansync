@@ -36,6 +36,7 @@ typedef struct {
     char          name[128];
     char          peer[64];
     char          remote_root[LS_PATHMAX];
+    int           mtime_ok; /* 客户端能否保留 mtime；不能就只能比大小 */
     SyncStats     st;
 } Client;
 
@@ -438,8 +439,10 @@ static void do_sync(Client *c, const Buf *list_begin)
         goto out;
     }
 
-    ls_log("[%s] 扫描完成：客户端 %zu 个文件 / 服务端 %zu 个文件", c->name, remote.n,
-           local.n);
+    ls_log("[%s] 扫描完成：客户端 %zu 个文件 / 服务端 %zu 个文件%s", c->name, remote.n,
+           local.n, c->mtime_ok ? "" : "（按大小比对）");
+
+    uint32_t by_size = 0;
 
     /*
      * 判定只看 大小 + 修改时间（都取纳秒），一个字节的内容都不读。
@@ -457,10 +460,23 @@ static void do_sync(Client *c, const Buf *list_begin)
             plan_add(&plan, le->rel, le->size, ACT_PUSH, "客户端缺失");
             continue;
         }
-        if (le->size == re->size && le->mtime == re->mtime) {
-            c->st.same++; /* 大小和时间都没变 —— 不读内容，直接判相同 */
-            ls_dbg("[%s] 相同  %s", c->name, le->rel);
-            continue;
+        if (le->size == re->size) {
+            if (!c->mtime_ok) {
+                /* 客户端保不住 mtime，时间戳没有可比性：只能按大小判 */
+                c->st.same++;
+                by_size++;
+                continue;
+            }
+            int64_t d = le->mtime - re->mtime;
+            if (d < 0) {
+                d = -d;
+            }
+            if (d <= LS_MTIME_TOLERANCE_NS) {
+                /* 容差内视为同一时刻：不同文件系统的 mtime 精度不一样 */
+                c->st.same++;
+                ls_dbg("[%s] 相同  %s", c->name, le->rel);
+                continue;
+            }
         }
         const char *why = le->size != re->size ? "大小不同" : "修改时间不同";
         if (server_wins(le, re)) {
@@ -484,6 +500,11 @@ static void do_sync(Client *c, const Buf *list_begin)
             c->st.ignored++;
             ls_log("[%s] 忽略客户端多出的文件（服务端只读）：%s", c->name, re->rel);
         }
+    }
+
+    if (by_size > 0) {
+        ls_log("[%s] 其中 %u 个文件只是大小相同就判为相同（客户端保不住 mtime，没能比对时间）",
+               c->name, by_size);
     }
 
     run_plan(c, &plan);
@@ -544,14 +565,23 @@ static void *client_thread(void *arg)
     char *cname = rd_str(&r);
     char *croot = rd_str(&r);
     uint32_t proto = rd_u32(&r);
+    uint64_t cli_ts = rd_u64(&r);
+    uint8_t cli_mtime_ok = rd_u8(&r);
     if (r.err || !cname || !croot) {
         free(cname);
         free(croot);
         ls_log("[%s] HELLO 报文错误，断开", c->peer);
         goto out;
     }
+    if (cli_ts != ls_build_ts()) {
+        /* 不做向前兼容：报出来，由客户端决定是更新还是退出 */
+        ls_log("[%s] 构建时间戳不同（客户端 %llu / 服务端 %llu，本服务端编译于 %s）",
+               cname[0] ? cname : c->peer, (unsigned long long)cli_ts,
+               (unsigned long long)ls_build_ts(), ls_build_date());
+    }
     snprintf(c->name, sizeof(c->name), "%s", cname[0] ? cname : c->peer);
     snprintf(c->remote_root, sizeof(c->remote_root), "%s", croot);
+    c->mtime_ok = cli_mtime_ok ? 1 : 0;
     free(cname);
     free(croot);
     buf_free(&b);
@@ -561,6 +591,9 @@ static void *client_thread(void *arg)
         goto out;
     }
     ls_log("[%s] 客户端接入：%s，目录 %s", c->name, c->peer, c->remote_root);
+    if (!c->mtime_ok) {
+        ls_log("[%s] 该设备无法保留文件修改时间，本次同步退化为「只比大小」", c->name);
+    }
 
     /* 2. HELLO_ACK */
     buf_init(&b);
@@ -570,6 +603,8 @@ static void *client_thread(void *arg)
     buf_put_u8(&b, (uint8_t)g_prefer);
     buf_put_u8(&b, (uint8_t)g_delete);
     buf_put_str(&b, g_client_subdir); /* 服务端指定客户端落盘的子目录，可空 */
+    buf_put_u64(&b, ls_build_ts());   /* 构建时间戳，客户端据此判断要不要更新 */
+    buf_put_str(&b, ls_build_date());
     if (ls_msg_send(c->fd, MSG_HELLO_ACK, &b) != 0) {
         buf_free(&b);
         goto out;
@@ -845,6 +880,7 @@ int server_main(int argc, char **argv)
         return 1;
     }
 
+    ls_log("%s", ls_build_info());
     ls_log("服务端「%s」启动：目录 %s，TCP %u，UDP 发现 %u", g_name, g_root, g_port,
            g_udp_port);
     ls_log("策略：%s%s；%s", g_prefer == PREFER_SERVER

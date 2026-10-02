@@ -259,6 +259,30 @@ int progress_active(void)
     return g_prog_active;
 }
 
+/* ======================= 版本 ======================= */
+
+const char *ls_version(void)
+{
+    return "1.0";
+}
+
+const char *ls_build_date(void)
+{
+    return LS_BUILD_DATE;
+}
+
+uint64_t ls_build_ts(void)
+{
+    return (uint64_t)LS_BUILD_TS;
+}
+
+const char *ls_build_info(void)
+{
+    static char b[128];
+    snprintf(b, sizeof(b), "lansync %s (built %s)", ls_version(), ls_build_date());
+    return b;
+}
+
 /* ======================= 熵 ======================= */
 
 double ls_entropy_file(const char *path, size_t sample_bytes)

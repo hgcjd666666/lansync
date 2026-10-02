@@ -13,6 +13,14 @@
 #include <sys/types.h>
 
 #define LS_PROTO        1
+
+/* 编译时刻，由 Makefile 通过 -D 注入；直接 gcc 编译时为 0/unknown */
+#ifndef LS_BUILD_TS
+#define LS_BUILD_TS 0
+#endif
+#ifndef LS_BUILD_DATE
+#define LS_BUILD_DATE "unknown"
+#endif
 #define LS_CHUNK        (256 * 1024)      /* 单条 DATA 消息的字节数 */
 #define LS_MAX_PAYLOAD  (8 * 1024 * 1024) /* 单条消息上限，防恶意分配 */
 #define LS_PATHMAX      4096
@@ -20,13 +28,19 @@
 #define LS_DEF_UDP_PORT 9528
 #define LS_TMP_PREFIX   ".lansync-tmp-"
 
+/*
+ * mtime 容差。不同文件系统的精度差很多：f2fs 记到纳秒，Android 的 FUSE
+ * (/storage) 只剩秒。严格按纳秒比较会永远判「不同」，导致每次全量重传。
+ */
+#define LS_MTIME_TOLERANCE_NS (2LL * 1000000000LL)
+
 /* 一个 bundle 最多装多少字节 / 多少个条目，超过就切开 */
 #define LS_BUNDLE_BYTES (64ull * 1024 * 1024)
 #define LS_BUNDLE_FILES 2000
 
 /* ---------------- 消息类型 ---------------- */
 enum {
-    MSG_HELLO      = 1,  /* C->S {str name, str root, u32 proto} */
+    MSG_HELLO      = 1,  /* C->S {str name, str root, u32 proto, u64 build_ts, u8 mtime_ok} */
     MSG_HELLO_ACK  = 2,  /* S->C {str sname, str sroot, u32 proto, u8 prefer, u8 del,
                                  str client_subdir} */
     MSG_LIST_BEGIN = 3,  /* C->S {u32 total} */
@@ -230,6 +244,14 @@ void fmt_size(uint64_t n, char *out, size_t cap);
 /* 最近一次传输失败的原因（线程局部，供调用方打印） */
 const char *ls_last_error(void);
 void ls_set_last_error(const char *fmt, ...);
+
+/* ---------------- 版本 ---------------- */
+
+const char *ls_version(void);    /* "1.0" */
+const char *ls_build_date(void); /* 编译时刻，人读 */
+uint64_t    ls_build_ts(void);   /* 编译时刻，Unix 秒，用于比对 */
+/* "lansync 1.0 (built 2025-10-02 03:47:53)" */
+const char *ls_build_info(void);
 
 /* ---------------- 日志 ---------------- */
 void ls_set_quiet(int q);

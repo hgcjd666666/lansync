@@ -188,8 +188,9 @@ def frame(t, payload=b''):
     return struct.pack('>BI', t, len(payload)) + payload
 
 sk = socket.create_connection(('127.0.0.1', port), timeout=5)
-# HELLO
-sk.sendall(frame(1, s('evil') + s(base) + struct.pack('>I', 1)))
+# HELLO：协议字段要与当前版本一致（proto, build_ts, mtime_ok）
+sk.sendall(frame(1, s('evil') + s(base) + struct.pack('>I', 1) +
+                 struct.pack('>Q', 0) + struct.pack('>B', 1)))
 # 读 HELLO_ACK
 hdr = sk.recv(5)
 # LIST_BEGIN + 一条含路径穿越的条目 + LIST_END
@@ -389,6 +390,39 @@ grep -q "易压缩" "$WORK/c14/txt.out" && grep -q "5 个" "$WORK/c14/txt.out" \
 grep -q "已压缩" "$WORK/c14/rnd.out" \
     && ok "随机数据落进「已压缩」（再压没意义）" \
     || { bad "随机数据判定异常"; sed 's/^/       /' "$WORK/c14/rnd.out"; }
+
+# ---------------------------------------------------------------- 用例 15
+section "用例 15：客户端保不住 mtime 时，退化成只比大小（不再反复全量重传）"
+SRV="$WORK/c15/srv"; CLI="$WORK/c15/cli"
+mkdir -p "$SRV" "$CLI"
+printf 'AAAA' > "$SRV/same-size.bin"; printf 'BBBB' > "$CLI/same-size.bin"
+printf 'new-on-server' > "$SRV/only-s.txt"
+mkdir -p "$CLI/sub"; printf 'x' > "$CLI/sub/keep.txt"
+
+start_server "$SRV" --keep-extra
+LANSYNC_FORCE_NO_MTIME=1 timeout 120 "$BIN" client -d "$CLI" -s 127.0.0.1 -p "$PORT" \
+    -n testcli >"$LASTCLIENT" 2>&1
+stop_server
+
+grep -q "无法保留文件修改时间" "$LASTCLIENT" && ok "客户端自检发现自己保不住 mtime 并告警" \
+    || { bad "客户端没有告警"; tail -5 "$LASTCLIENT" | sed 's/^/       /'; }
+grep -q "退化为「只比大小」" "$LASTLOG" && ok "服务端据此切换策略" \
+    || { bad "服务端没切换策略"; grep "客户端接入" "$LASTLOG" | sed 's/^/       /'; }
+[ "$(cat "$CLI/same-size.bin")" = "BBBB" ] \
+    && ok "同大小不同内容被判为相同（退化模式的已知代价）" \
+    || bad "不该传的却传了"
+[ -e "$CLI/only-s.txt" ] && ok "服务端独有的文件照常推送（首次同步不受影响）" \
+    || bad "退化后连该传的都没传"
+
+# 再跑一次，确认收敛（不会每次全量重传）
+BEFORE=$(find "$CLI" -type f | wc -l)
+start_server "$SRV" --keep-extra
+LANSYNC_FORCE_NO_MTIME=1 timeout 120 "$BIN" client -d "$CLI" -s 127.0.0.1 -p "$PORT" \
+    -n testcli >"$LASTCLIENT" 2>&1
+stop_server
+grep -q "推送 0 / 拉取 0" "$LASTLOG" && ok "第二次同步不再重传任何文件（已收敛）" \
+    || { bad "又重传了"; grep "同步结束" "$LASTLOG" | sed 's/^/       /'; }
+[ "$(find "$CLI" -type f | wc -l)" = "$BEFORE" ] && ok "文件数没变" || bad "文件数异常"
 
 # ---------------------------------------------------------------- 汇总
 printf '\n\033[1m========== 结果：%d 通过 / %d 失败 ==========\033[0m\n' "$PASS" "$FAIL"

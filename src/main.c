@@ -2,6 +2,8 @@
  * main.c -- lansync 入口与自检
  */
 #include <stdio.h>
+#include "common.h"
+
 #include <string.h>
 
 
@@ -59,7 +61,8 @@ int main(int argc, char **argv)
         return 0;
     }
     if (strcmp(cmd, "-V") == 0 || strcmp(cmd, "--version") == 0) {
-        printf("lansync %s\n", "1.0");
+        printf("%s\n", ls_build_info());
+        printf("build timestamp: %llu\n", (unsigned long long)ls_build_ts());
         return 0;
     }
 

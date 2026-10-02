@@ -35,6 +35,11 @@ typedef struct {
     uint64_t bytes;
 } SyncStats;
 
+/* 两端构建不一致时是否继续（默认要求更新或退出） */
+static int g_ignore_version = 0;
+/* 本机文件系统能否保留 mtime；不能就只能按大小比对 */
+static int g_mtime_ok = 1;
+
 /* ---------------- 局域网发现 ---------------- */
 
 /* 报文格式（换行分隔，path 里可以有空格）：
@@ -352,9 +357,129 @@ static void update_usage(const char *prog, int debug)
     }
 }
 
+/* ---------------- 探测本机文件系统能否保留 mtime ---------------- */
+
+/*
+ * 在同步根目录写一个探针，把 mtime 设成 2020-01-01，再读回来核对。
+ * 能设上（哪怕被截断到秒）就算可信；设不上（读回来是「现在」）说明这个
+ * 文件系统不支持改时间戳，此时 mtime 比对毫无意义，必须退化。
+ */
+static int mtime_capable(const char *root)
+{
+    char probe[LS_PATHMAX];
+    if (getenv("LANSYNC_FORCE_NO_MTIME")) {
+        return 0; /* 测试用：假装这个文件系统保不住 mtime */
+    }
+    const int64_t want = 1577836800LL * 1000000000LL; /* 2020-01-01 UTC */
+    int n = snprintf(probe, sizeof(probe), "%s/" LS_TMP_PREFIX "mtime-probe", root);
+    if (n < 0 || n >= (int)sizeof(probe)) {
+        return 1;
+    }
+
+    FILE *f = fopen(probe, "wb");
+    if (!f) {
+        return 1; /* 目录写不了，交给同步阶段报错 */
+    }
+    fputs("probe", f);
+    fclose(f);
+
+    (void)set_mtime(probe, want);
+
+    int ok = 1;
+    struct stat st;
+    if (stat(probe, &st) == 0) {
+        int64_t got = (int64_t)st.st_mtim.tv_sec * 1000000000LL + (int64_t)st.st_mtim.tv_nsec;
+        int64_t d = got - want;
+        if (d < 0) {
+            d = -d;
+        }
+        ok = (d <= LS_MTIME_TOLERANCE_NS);
+    }
+    unlink(probe);
+    return ok;
+}
+
+/* ---------------- 自身路径与取回程序本体 ---------------- */
+
+static int self_path(char *out, size_t cap)
+{
+    ssize_t k = readlink("/proc/self/exe", out, cap - 1);
+    if (k <= 0) {
+        return -1;
+    }
+    out[k] = '\0';
+    return 0;
+}
+
+/*
+ * 在已建立的连接上把服务端的程序本体取回来并替换 target。
+ * 调用方需保证服务端此刻正等着 MSG_WANT_SELF。成功返回 0。
+ */
+static int fetch_self_over(int fd, const char *target, uint64_t *bytes_out)
+{
+    char dirbuf[LS_PATHMAX];
+    char tmpname[64];
+    char tmpfull[LS_PATHMAX];
+    uint64_t bytes = 0;
+    Buf b;
+
+    {
+        char t[LS_PATHMAX];
+        char *slash;
+        snprintf(t, sizeof(t), "%s", target);
+        slash = strrchr(t, '/');
+        if (slash) {
+            *slash = '\0';
+            snprintf(dirbuf, sizeof(dirbuf), "%s", t[0] ? t : "/");
+        } else {
+            snprintf(dirbuf, sizeof(dirbuf), ".");
+        }
+    }
+    snprintf(tmpname, sizeof(tmpname), ".lansync-new-%d", (int)getpid());
+    if (snprintf(tmpfull, sizeof(tmpfull), "%s/%s", dirbuf, tmpname) >=
+        (int)sizeof(tmpfull)) {
+        ls_set_last_error("临时文件路径过长");
+        return -1;
+    }
+
+    if (ls_msg_send(fd, MSG_WANT_SELF, NULL) != 0) {
+        ls_set_last_error("请求发送失败: %s", strerror(errno));
+        return -1;
+    }
+
+    buf_init(&b);
+    if (ls_expect(fd, MSG_BUNDLE_BEGIN, &b) != 0) {
+        buf_free(&b);
+        ls_set_last_error("服务端没有提供可分发的程序");
+        return -1;
+    }
+    {
+        SinkCtx sc;
+        memset(&sc, 0, sizeof(sc));
+        sc.abs_target = tmpfull;
+        uint32_t okn = 0, failn = 0;
+        int r = ls_recv_bundle_body(fd, &b, cli_sink_factory, &sc, &okn, &failn, &bytes);
+        buf_free(&b);
+        if (r != 0 || okn != 1) {
+            return -1;
+        }
+    }
+
+    (void)chmod(tmpfull, 0755);
+    if (rename(tmpfull, target) != 0) {
+        ls_set_last_error("无法替换 %s: %s", target, strerror(errno));
+        unlink(tmpfull);
+        return -1;
+    }
+    if (bytes_out) {
+        *bytes_out = bytes;
+    }
+    return 0;
+}
+
 static int client_update_main(int argc, char **argv)
 {
-    enum { OPT_SNAME = 1000, OPT_HDEBUG };
+    enum { OPT_SNAME = 1000, OPT_HDEBUG, OPT_IGNVER };
     static const struct option opts[] = {
         {"server", required_argument, 0, 's'},
         {"port", required_argument, 0, 'p'},
@@ -386,7 +511,6 @@ static int client_update_main(int argc, char **argv)
     int rc = 1;
     Buf b;
     Offer o;
-    uint64_t bytes = 0;
     int c;
 
     while ((c = getopt_long(argc, argv, "s:p:w:n:t:o:vqh", opts, NULL)) != -1) {
@@ -471,6 +595,8 @@ static int client_update_main(int argc, char **argv)
     buf_put_str(&b, myname);
     buf_put_str(&b, ".");
     buf_put_u32(&b, LS_PROTO);
+    buf_put_u64(&b, ls_build_ts());
+    buf_put_u8(&b, 1); /* update 不做同步判定，这个字段无意义 */
     if (ls_msg_send(fd, MSG_HELLO, &b) != 0) {
         buf_free(&b);
         goto done;
@@ -485,40 +611,14 @@ static int client_update_main(int argc, char **argv)
     }
     buf_free(&b);
 
-    if (ls_msg_send(fd, MSG_WANT_SELF, NULL) != 0) {
-        ls_log("请求发送失败");
-        goto done;
-    }
-
-    buf_init(&b);
-    if (ls_expect(fd, MSG_BUNDLE_BEGIN, &b) != 0) {
-        ls_log("服务端没有提供可分发的程序");
-        buf_free(&b);
-        goto done;
-    }
     {
-        SinkCtx sc;
-        memset(&sc, 0, sizeof(sc));
-        sc.abs_target = tmpfull;
-        uint32_t okn = 0, failn = 0;
-        if (ls_recv_bundle_body(fd, &b, cli_sink_factory, &sc, &okn, &failn, &bytes) != 0 ||
-            okn != 1) {
-            ls_log("下载失败：%s", ls_last_error());
-            buf_free(&b);
+        uint64_t nbytes = 0;
+        if (fetch_self_over(fd, target, &nbytes) != 0) {
+            ls_log("更新失败：%s", ls_last_error());
             goto done;
         }
-    }
-    buf_free(&b);
-
-    (void)chmod(tmpfull, 0755);
-    if (rename(tmpfull, target) != 0) {
-        ls_log("无法替换 %s：%s", target, strerror(errno));
-        unlink(tmpfull);
-        goto done;
-    }
-    {
         char sz[32];
-        fmt_size(bytes, sz, sizeof(sz));
+        fmt_size(nbytes, sz, sizeof(sz));
         ls_log("已更新 %s（%s）", target, sz);
     }
     rc = 0;
@@ -536,7 +636,7 @@ int client_main(int argc, char **argv)
         return client_update_main(argc - 1, argv + 1);
     }
 
-    enum { OPT_SNAME = 1000, OPT_HDEBUG };
+    enum { OPT_SNAME = 1000, OPT_HDEBUG, OPT_IGNVER };
     static const struct option opts[] = {
         {"dir", required_argument, 0, 'd'},
         {"server", required_argument, 0, 's'},
@@ -549,6 +649,7 @@ int client_main(int argc, char **argv)
         {"quiet", no_argument, 0, 'q'},
         {"help", no_argument, 0, 'h'},
         {"help-debug", no_argument, 0, OPT_HDEBUG},
+        {"ignore-version", no_argument, 0, OPT_IGNVER},
         {0, 0, 0, 0}};
 
     const char *dir = NULL;
@@ -573,9 +674,12 @@ int client_main(int argc, char **argv)
         case 'q': ls_set_quiet(1); break;
         case 'h': usage("lansync", 0); return 0;
         case OPT_HDEBUG: usage("lansync", 1); return 0;
+        case OPT_IGNVER: g_ignore_version = 1; break;
         default: usage("lansync", 0); return 2;
         }
     }
+
+    ls_log("%s", ls_build_info());
 
     if (!dir) {
         dir = ".";
@@ -611,6 +715,13 @@ int client_main(int argc, char **argv)
     }
 
     signal(SIGPIPE, SIG_IGN);
+
+    /* 探一下本机能不能保住 mtime，结果要报给服务端 */
+    g_mtime_ok = mtime_capable(root);
+    if (!g_mtime_ok) {
+        ls_log("警告：本机文件系统无法保留文件修改时间（%s）", root);
+        ls_log("      同步将退化为「只比较大小」，同大小不同内容的文件不会被发现。");
+    }
 
     /* 1. 找服务端 */
     char server_ip[64] = {0};
@@ -653,6 +764,8 @@ int client_main(int argc, char **argv)
     buf_put_str(&b, myname);
     buf_put_str(&b, root);
     buf_put_u32(&b, LS_PROTO);
+    buf_put_u64(&b, ls_build_ts());
+    buf_put_u8(&b, (uint8_t)g_mtime_ok);
     if (ls_msg_send(fd, MSG_HELLO, &b) != 0) {
         ls_log("发送 HELLO 失败");
         rc = 1;
@@ -676,11 +789,14 @@ int client_main(int argc, char **argv)
         uint8_t prefer = rd_u8(&r);
         uint8_t del = rd_u8(&r);
         char *subdir = rd_str(&r);
+        uint64_t srv_ts = rd_u64(&r);
+        char *srv_date = rd_str(&r);
         if (r.err || proto != LS_PROTO) {
             ls_log("服务端协议版本不匹配");
             free(sname);
             free(sroot);
             free(subdir);
+            free(srv_date);
             rc = 1;
             goto out;
         }
@@ -692,6 +808,54 @@ int client_main(int argc, char **argv)
                del ? " + 镜像删除" : "");
         free(sname);
         free(sroot);
+
+        /*
+         * 两端必须是同一次构建。不做向前兼容——版本不同就要么更新、要么退出，
+         * 这样协议改动不必背兼容包袱。更新通道本身是保留的。
+         */
+        if (srv_ts != ls_build_ts() && !g_ignore_version) {
+            ls_log("本机与服务端不是同一次构建：");
+            ls_log("  服务端  %s  (build %llu)", srv_date ? srv_date : "?",
+                   (unsigned long long)srv_ts);
+            ls_log("  本机    %s  (build %llu)", ls_build_date(),
+                   (unsigned long long)ls_build_ts());
+
+            if (!isatty(STDIN_FILENO)) {
+                ls_log("非交互环境，退出。要更新请运行：");
+                ls_log("  lansync client update -s %s -p %u", server_ip, server_port);
+                free(srv_date);
+                rc = 1;
+                goto out;
+            }
+
+            fprintf(stderr, "是否从服务端更新本程序并退出？[y/N] ");
+            fflush(stderr);
+            char ans[32] = {0};
+            if (!fgets(ans, sizeof(ans), stdin) || (ans[0] != 'y' && ans[0] != 'Y')) {
+                ls_log("已取消。两端构建不一致，退出。");
+                free(srv_date);
+                rc = 1;
+                goto out;
+            }
+
+            char selfbuf[LS_PATHMAX];
+            uint64_t nbytes = 0;
+            if (self_path(selfbuf, sizeof(selfbuf)) != 0) {
+                ls_log("无法确定自身路径，请手动运行 lansync client update");
+                rc = 1;
+            } else if (fetch_self_over(fd, selfbuf, &nbytes) != 0) {
+                ls_log("更新失败：%s", ls_last_error());
+                rc = 1;
+            } else {
+                char sz[32];
+                fmt_size(nbytes, sz, sizeof(sz));
+                ls_log("已更新 %s（%s），请重新运行", selfbuf, sz);
+                rc = 0;
+            }
+            free(srv_date);
+            goto out;
+        }
+        free(srv_date);
 
         /* 服务端可以强制指定客户端把文件落在哪个子目录下 */
         if (subdir && *subdir && path_safe(subdir)) {
