@@ -268,7 +268,9 @@ static void push_batch(Client *c, PlanItem *items, size_t n)
         if (rc == 0) {
             ls_dbg("[%s] 本批推送 %u 个文件，%s", c->name, ok, sz);
         } else {
-            ls_log("[%s] 推送失败：%s", c->name, ls_last_error());
+            /* 全部或部分失败都要让人看见，别只留一个计数器 */
+            ls_log("[%s] 本批推送成功 %u / 失败 %u，%s", c->name, ok, failed,
+                   ls_last_error());
         }
         c->st.pushed += ok;
         c->st.failed += failed;
@@ -360,13 +362,11 @@ static void run_plan(Client *c, Plan *plan)
                 total_files++;
             }
         }
-        char summary[192];
+        uint32_t ok_before = c->st.pushed + c->st.pulled;
+        uint32_t fail_before = c->st.failed;
+        char summary[256] = {0};
         if (total_files > 0) {
-            char sz[32];
-            fmt_size(total_bytes, sz, sizeof(sz));
             progress_begin(want == ACT_PUSH ? "推送" : "拉取", total_bytes, total_files);
-            snprintf(summary, sizeof(summary), "%s完成：%u 个文件，%s",
-                     want == ACT_PUSH ? "推送" : "拉取", total_files, sz);
         }
 
         size_t i = 0;
@@ -402,6 +402,15 @@ static void run_plan(Client *c, Plan *plan)
         }
 
         if (total_files > 0) {
+            uint32_t okn = (c->st.pushed + c->st.pulled) - ok_before;
+            uint32_t failn = c->st.failed - fail_before;
+            if (failn) {
+                snprintf(summary, sizeof(summary), "%s结束：成功 %u / 失败 %u",
+                         want == ACT_PUSH ? "推送" : "拉取", okn, failn);
+            } else {
+                snprintf(summary, sizeof(summary), "%s完成：%u 个文件",
+                         want == ACT_PUSH ? "推送" : "拉取", okn);
+            }
             progress_end(summary);
         }
     }

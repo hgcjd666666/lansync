@@ -189,11 +189,11 @@ static void prog_draw_locked(int force)
             bar_w = 6;
         }
     }
-    if (bar_w > 40) {
-        bar_w = 40;
+    char bar[256];
+    /* 长度完全由终端宽度决定，不设人为上限：宽终端就把整行铺满 */
+    if (bar_w > (int)sizeof(bar) - 1) {
+        bar_w = (int)sizeof(bar) - 1;
     }
-
-    char bar[48];
     int filled = pct * bar_w / 100;
     for (int i = 0; i < bar_w; i++) {
         bar[i] = i < filled ? '#' : '.';
@@ -1453,7 +1453,8 @@ int ls_send_bundle(int fd, const char *root, const BundleEntry *ents, size_t n,
     uint32_t done = rd_u32(&r);
     uint32_t fail = rd_u32(&r);
     if (!ok) {
-        ls_set_last_error("对端报告失败: %s", msg ? msg : "(无说明)");
+        ls_set_last_error("对端报告失败（成功 %u / 失败 %u）: %s", done, fail,
+                          msg ? msg : "(无说明)");
     }
     free(msg);
     buf_free(&ack);
@@ -1659,7 +1660,8 @@ ack:
     {
         Buf ack;
         buf_init(&ack);
-        buf_put_u8(&ack, 1);
+        /* 有失败就必须让对端知道，否则它会把「全部失败」当成功 */
+        buf_put_u8(&ack, failed == 0 ? 1 : 0);
         buf_put_str(&ack, first_err[0] ? first_err : "ok");
         buf_put_u32(&ack, ok);
         buf_put_u32(&ack, failed);
@@ -1674,11 +1676,15 @@ ack:
 #undef SETTLE
 
     if (own_progress) {
-        char buf[160];
+        char buf[768];
         char d[32];
         fmt_size(total, d, sizeof(d));
-        snprintf(buf, sizeof(buf), "接收完成：%u 个文件，%s%s", ok, d,
-                 failed ? "（有失败）" : "");
+        if (failed) {
+            snprintf(buf, sizeof(buf), "接收：成功 %u / 失败 %u，%s —— %.400s", ok, failed, d,
+                     first_err[0] ? first_err : ls_last_error());
+        } else {
+            snprintf(buf, sizeof(buf), "接收完成：%u 个文件，%s", ok, d);
+        }
         progress_end(buf);
     }
 

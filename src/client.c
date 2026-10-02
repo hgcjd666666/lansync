@@ -833,6 +833,10 @@ int client_main(int argc, char **argv)
             if (progress_active()) {
                 progress_end(NULL); /* 擦掉进度行，摘要交给下面的统计日志 */
             }
+            if (fail > 0) {
+                /* 别只报一个数字，把原因也说出来 */
+                ls_log("有 %u 个文件没能同步：%s", fail, ls_last_error());
+            }
             char sz[32];
             fmt_size(bytes, sz, sizeof(sz));
             ls_log("");
