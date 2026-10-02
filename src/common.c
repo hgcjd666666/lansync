@@ -955,11 +955,41 @@ int ls_udp_open(uint16_t port, int reuse)
     return fd;
 }
 
+/* 把发往的地址记进 detail（逗号分隔，发送失败的加 "!"） */
+static void bc_detail_add(char *detail, size_t cap, const char *addr, int ok)
+{
+    if (!detail || cap == 0) {
+        return;
+    }
+    size_t n = strlen(detail);
+    if (n > 0) {
+        if (n + 1 >= cap) {
+            return;
+        }
+        detail[n++] = ',';
+        detail[n] = '\0';
+    }
+    size_t alen = strlen(addr);
+    if (n + alen + (ok ? 0 : 1) + 1 > cap) {
+        return;
+    }
+    memcpy(detail + n, addr, alen);
+    n += alen;
+    if (!ok) {
+        detail[n++] = '!';
+    }
+    detail[n] = '\0';
+}
+
 /*
  * 向各网段的广播地址各发一份。多网卡（如 wlan0 + ap0）下只发
  * 255.255.255.255 会受默认路由影响走不到所有网段。
+ *
+ * detail 里记下实际发往的地址，专门为了排查「发现不到服务端」：
+ * 手机上接口一堆（wlan0/ap0/bt-pan/ccmni*），广播发错网段就等于没发。
  */
-int ls_udp_broadcast(int fd, uint16_t port, const char *text)
+int ls_udp_broadcast(int fd, uint16_t port, const char *text, char *detail,
+                     size_t detail_cap)
 {
     size_t len = strlen(text);
     struct sockaddr_in sa;
@@ -967,13 +997,19 @@ int ls_udp_broadcast(int fd, uint16_t port, const char *text)
     sa.sin_family = AF_INET;
     sa.sin_port = htons(port);
 
+    if (detail && detail_cap) {
+        detail[0] = '\0';
+    }
+
     int sent = 0;
 
     /* 1) 全局广播 */
     sa.sin_addr.s_addr = htonl(INADDR_BROADCAST);
-    if (sendto(fd, text, len, 0, (struct sockaddr *)&sa, sizeof(sa)) >= 0) {
+    int ok = sendto(fd, text, len, 0, (struct sockaddr *)&sa, sizeof(sa)) >= 0;
+    if (ok) {
         sent++;
     }
+    bc_detail_add(detail, detail_cap, "255.255.255.255", ok);
 
     /* 2) 每个非回环、支持广播的接口，各发一份到其子网广播地址。
      *    不用 getifaddrs（bionic 从 API 24 才有），也不用 /proc/net/dev
@@ -988,6 +1024,7 @@ int ls_udp_broadcast(int fd, uint16_t port, const char *text)
     ifc.ifc_buf = ifbuf;
     if (ioctl(s, SIOCGIFCONF, &ifc) < 0) {
         close(s);
+        bc_detail_add(detail, detail_cap, "(枚举接口失败)", 0);
         return sent;
     }
 
@@ -1003,7 +1040,11 @@ int ls_udp_broadcast(int fd, uint16_t port, const char *text)
         if (!(req.ifr_flags & IFF_BROADCAST) || (req.ifr_flags & IFF_LOOPBACK)) {
             continue;
         }
+        char ifname[IFNAMSIZ];
+        snprintf(ifname, sizeof(ifname), "%s:", req.ifr_name);
+
         if (ioctl(s, SIOCGIFBRDADDR, &req) < 0) {
+            bc_detail_add(detail, detail_cap, ifname, 0);
             continue;
         }
         struct sockaddr_in *br = (struct sockaddr_in *)&req.ifr_broadaddr;
@@ -1011,9 +1052,18 @@ int ls_udp_broadcast(int fd, uint16_t port, const char *text)
             continue;
         }
         sa.sin_addr = br->sin_addr;
-        if (sendto(fd, text, len, 0, (struct sockaddr *)&sa, sizeof(sa)) >= 0) {
+        char ip[32];
+        char addr[64];
+        if (!inet_ntop(AF_INET, &sa.sin_addr, ip, sizeof(ip))) {
+            snprintf(ip, sizeof(ip), "?");
+        }
+        /* 带上接口名：发现不到服务端时，一眼能看出 wlan0 到底在不在里面 */
+        snprintf(addr, sizeof(addr), "%s(%s)", ip, req.ifr_name);
+        ok = sendto(fd, text, len, 0, (struct sockaddr *)&sa, sizeof(sa)) >= 0;
+        if (ok) {
             sent++;
         }
+        bc_detail_add(detail, detail_cap, addr, ok);
     }
     close(s);
     return sent;

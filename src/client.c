@@ -26,6 +26,13 @@ typedef struct {
     char     root[LS_PATHMAX];
 } Offer;
 
+/* 一次发现可能收到好几份应答，见 discover_all 的注释 */
+#define LS_MAX_OFFERS 16
+typedef struct {
+    Offer v[LS_MAX_OFFERS];
+    int   n;
+} OfferList;
+
 typedef struct {
     uint32_t pushed;
     uint32_t pulled;
@@ -90,28 +97,45 @@ static int parse_offer(const char *buf, Offer *o)
     return 0;
 }
 
-static int discover(Offer *out, uint16_t udp_port, int timeout_ms, const char *filter)
+/*
+ * 收集所有应答，按 ip:port 去重。
+ *
+ * 为什么不一收到就返回：同一个服务端会从每个接口各回一份（手机上有
+ * wlan0/ap0/bt-pan/tun0 时就是好几份，源地址各不相同），而其中某个地址
+ * 不一定连得上。调用方应该拿全了再交给 connect_any 逐个试。
+ *
+ * verbose 非 0 时把「广播发到哪些地址」也打出来 —— 发现不到服务端时，
+ * 这是第一个要看的：没有服务端所在网段的地址就等于没发出去。
+ */
+static int discover_all(OfferList *out, uint16_t udp_port, int timeout_ms,
+                        const char *filter, int verbose)
 {
+    out->n = 0;
     int fd = ls_udp_open(0, 1);
     if (fd < 0) {
         ls_log("无法创建 UDP socket：%s", strerror(errno));
         return -1;
     }
 
+    char where[512];
+    int sent = 0;
     for (int i = 0; i < 3; i++) {
-        int n = ls_udp_broadcast(fd, udp_port, "LANDSYNC_DISCOVER 1\n");
-        if (i == 0 && n <= 0) {
-            ls_log("UDP 广播发送失败：%s", strerror(errno));
-        }
+        sent = ls_udp_broadcast(fd, udp_port, "LANDSYNC_DISCOVER 1\n", where,
+                                sizeof(where));
         struct pollfd p;
         p.fd = fd;
         p.events = POLLIN;
         p.revents = 0;
         poll(&p, 1, 60);
     }
+    if (sent <= 0) {
+        ls_log("UDP 广播一个都没发出去：%s", strerror(errno));
+    }
+    if (verbose) {
+        ls_log("广播已发往 %d 个地址：%s", sent, where[0] ? where : "(一个都没发出去)");
+    }
 
     uint64_t deadline = ls_now_ms() + (uint64_t)timeout_ms;
-    int found = -1;
     while (ls_now_ms() < deadline) {
         uint64_t left = deadline - ls_now_ms();
         struct pollfd p;
@@ -139,12 +163,42 @@ static int discover(Offer *out, uint16_t udp_port, int timeout_ms, const char *f
         if (filter && *filter && strcmp(o.name, filter) != 0) {
             continue;
         }
-        *out = o;
-        found = 0;
-        break;
+        int dup = 0;
+        for (int i = 0; i < out->n; i++) {
+            if (strcmp(out->v[i].ip, o.ip) == 0 && out->v[i].port == o.port) {
+                dup = 1;
+                break;
+            }
+        }
+        if (!dup && out->n < LS_MAX_OFFERS) {
+            out->v[out->n++] = o;
+        }
     }
     close(fd);
-    return found;
+    return out->n;
+}
+
+/*
+ * 依次尝试候选地址，返回第一个连上的连接，并把它的信息写进 chosen。
+ * 必须都试：同一服务端的几个应答地址里，可能混着 tun0/VPN 这类本机有地址
+ * 但对端不在上面的接口，先拿到哪个纯看包到达顺序。
+ */
+static int connect_any(const OfferList *cands, Offer *chosen)
+{
+    for (int i = 0; i < cands->n; i++) {
+        int fd = ls_tcp_connect(cands->v[i].ip, cands->v[i].port);
+        if (fd >= 0) {
+            if (chosen) {
+                *chosen = cands->v[i];
+            }
+            return fd;
+        }
+        if (cands->n > 1) {
+            ls_log("  连不上 %s:%u（%s），试下一个", cands->v[i].ip, cands->v[i].port,
+                   strerror(errno));
+        }
+    }
+    return -1;
 }
 
 /* ---------------- 清单上报（分片，避免超过单条消息上限） ---------------- */
@@ -514,7 +568,6 @@ static int client_update_main(int argc, char **argv)
     int fd = -1;
     int rc = 1;
     Buf b;
-    Offer o;
     int c;
 
     while ((c = getopt_long(argc, argv, "s:p:w:n:t:o:vqh", opts, NULL)) != -1) {
@@ -574,24 +627,27 @@ static int client_update_main(int argc, char **argv)
     server_port = port;
     if (server && *server) {
         snprintf(server_ip, sizeof(server_ip), "%s", server);
+        fd = ls_tcp_connect(server_ip, server_port);
+        if (fd < 0) {
+            ls_log("连接 %s:%u 失败：%s", server_ip, server_port, strerror(errno));
+            return 1;
+        }
     } else {
-        memset(&o, 0, sizeof(o));
+        OfferList cands;
         ls_log("正在搜索服务端…");
-        if (discover(&o, udp_port, timeout_ms, server_name) != 0) {
+        if (discover_all(&cands, udp_port, timeout_ms, server_name, 0) <= 0) {
             ls_log("没找到服务端，请用 -s 指定 IP");
             return 1;
         }
-        snprintf(server_ip, sizeof(server_ip), "%s", o.ip);
-        if (o.port) {
-            server_port = o.port;
+        Offer chosen;
+        fd = connect_any(&cands, &chosen);
+        if (fd < 0) {
+            ls_log("发现了服务端，但 %d 个应答地址一个都连不上", cands.n);
+            return 1;
         }
-        ls_log("发现服务端「%s」%s:%u", o.name, o.ip, o.port);
-    }
-
-    fd = ls_tcp_connect(server_ip, server_port);
-    if (fd < 0) {
-        ls_log("连接 %s:%u 失败：%s", server_ip, server_port, strerror(errno));
-        return 1;
+        snprintf(server_ip, sizeof(server_ip), "%s", chosen.ip);
+        server_port = chosen.port;
+        ls_log("发现服务端「%s」%s:%u", chosen.name, chosen.ip, chosen.port);
     }
 
     /* HELLO（update 不涉及目录，随便报一个） */
@@ -730,28 +786,33 @@ int client_main(int argc, char **argv)
     /* 1. 找服务端 */
     char server_ip[64] = {0};
     uint16_t server_port = port;
+    int fd = -1;
     if (server && *server) {
         snprintf(server_ip, sizeof(server_ip), "%s", server);
+        fd = ls_tcp_connect(server_ip, server_port);
+        if (fd < 0) {
+            ls_log("连接 %s:%u 失败：%s", server_ip, server_port, strerror(errno));
+            return 1;
+        }
     } else {
         ls_log("正在局域网内搜索服务端（UDP %u，最多等 %d ms）…", udp_port, timeout_ms);
-        Offer o;
-        memset(&o, 0, sizeof(o));
-        if (discover(&o, udp_port, timeout_ms, server_name) != 0) {
+        OfferList cands;
+        if (discover_all(&cands, udp_port, timeout_ms, server_name, 1) <= 0) {
             ls_log("没找到服务端。请确认服务端已启动，或用 -s 直接指定 IP。");
             return 1;
         }
-        snprintf(server_ip, sizeof(server_ip), "%s", o.ip);
-        if (o.port) {
-            server_port = o.port;
+        for (int i = 0; i < cands.n; i++) {
+            ls_log("  应答 %s:%u  服务端「%s」目录 %s", cands.v[i].ip, cands.v[i].port,
+                   cands.v[i].name, cands.v[i].root);
         }
-        ls_log("发现服务端「%s」%s:%u（目录 %s）", o.name, o.ip, o.port, o.root);
-    }
-
-    /* 2. 连接 */
-    int fd = ls_tcp_connect(server_ip, server_port);
-    if (fd < 0) {
-        ls_log("连接 %s:%u 失败：%s", server_ip, server_port, strerror(errno));
-        return 1;
+        Offer chosen;
+        fd = connect_any(&cands, &chosen);
+        if (fd < 0) {
+            ls_log("发现了服务端，但 %d 个应答地址一个都连不上", cands.n);
+            return 1;
+        }
+        snprintf(server_ip, sizeof(server_ip), "%s", chosen.ip);
+        server_port = chosen.port;
     }
     ls_set_timeout(fd, 300);
     ls_log("已连接 %s:%u", server_ip, server_port);
@@ -1115,60 +1176,36 @@ int discover_main(int argc, char **argv)
         case 'n': filter = optarg; break;
         case 'v': ls_set_verbose(1); break;
         case 'h':
-            printf("用法: %s discover [-w UDP端口] [-t 超时毫秒] [-n 只匹配该名字]\n", argv[0]);
+            printf("用法: lansync discover [-w UDP端口] [-t 超时毫秒] [-n 只匹配该名字]\n");
             return 0;
         default: return 2;
         }
     }
 
-    int fd = ls_udp_open(0, 1);
-    if (fd < 0) {
-        fprintf(stderr, "UDP socket 创建失败：%s\n", strerror(errno));
-        return 1;
-    }
-    for (int i = 0; i < 3; i++) {
-        ls_udp_broadcast(fd, udp_port, "LANDSYNC_DISCOVER 1\n");
-        struct pollfd p;
-        p.fd = fd;
-        p.events = POLLIN;
-        p.revents = 0;
-        poll(&p, 1, 60);
-    }
-
-    int found = 0;
-    uint64_t deadline = ls_now_ms() + (uint64_t)timeout_ms;
-    while (ls_now_ms() < deadline) {
-        struct pollfd p;
-        p.fd = fd;
-        p.events = POLLIN;
-        p.revents = 0;
-        if (poll(&p, 1, 200) <= 0) {
-            continue;
-        }
-        char buf[LS_PATHMAX + 512];
-        struct sockaddr_in from;
-        socklen_t fl = sizeof(from);
-        ssize_t n = recvfrom(fd, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&from, &fl);
-        if (n <= 0) {
-            continue;
-        }
-        buf[n] = '\0';
-        Offer o;
-        memset(&o, 0, sizeof(o));
-        if (parse_offer(buf, &o) != 0) {
-            continue;
-        }
-        inet_ntop(AF_INET, &from.sin_addr, o.ip, sizeof(o.ip));
-        if (filter && *filter && strcmp(o.name, filter) != 0) {
-            continue;
-        }
-        printf("%s:%u  名称=%s  目录=%s\n", o.ip, o.port, o.name, o.root);
-        found++;
-    }
-    close(fd);
-    if (!found) {
+    OfferList cands;
+    if (discover_all(&cands, udp_port, timeout_ms, filter, 1) <= 0) {
         printf("没有发现任何服务端\n");
         return 1;
+    }
+
+    /* 打印时再按 名字+目录 去重：同一个服务端会从每个接口各回一份 */
+    Offer seen[LS_MAX_OFFERS];
+    int nseen = 0;
+    for (int i = 0; i < cands.n; i++) {
+        int dup = 0;
+        for (int j = 0; j < nseen; j++) {
+            if (strcmp(seen[j].name, cands.v[i].name) == 0 &&
+                strcmp(seen[j].root, cands.v[i].root) == 0) {
+                dup = 1;
+                break;
+            }
+        }
+        if (dup) {
+            continue;
+        }
+        seen[nseen++] = cands.v[i];
+        printf("%s:%u  名称=%s  目录=%s\n", cands.v[i].ip, cands.v[i].port,
+               cands.v[i].name, cands.v[i].root);
     }
     return 0;
 }

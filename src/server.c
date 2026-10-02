@@ -778,7 +778,7 @@ static void udp_announce(int fd)
     /* 换行分隔：第二行是名字、第三行是路径，因此路径里的空格不会破坏解析 */
     char msg[LS_PATHMAX + 128];
     snprintf(msg, sizeof(msg), "LANDSYNC_ANNOUNCE %u\n%s\n%s\n", g_port, g_name, g_root);
-    int n = ls_udp_broadcast(fd, g_udp_port, msg);
+    int n = ls_udp_broadcast(fd, g_udp_port, msg, NULL, 0);
     (void)n; /* release 版里下一行的 ls_dbg 会消失，n 就没人用了 */
     ls_dbg("已向 %d 个广播地址发出 ANNOUNCE", n);
 }
@@ -815,10 +815,46 @@ static void *udp_thread(void *arg)
                     char reply[LS_PATHMAX + 128];
                     int m = snprintf(reply, sizeof(reply), "LANDSYNC_OFFER %u\n%s\n%s\n",
                                      g_port, g_name, g_root);
-                    sendto(fd, reply, (size_t)m, 0, (struct sockaddr *)&from, fl);
+                    int sr = sendto(fd, reply, (size_t)m, 0, (struct sockaddr *)&from, fl);
                     char ip[INET_ADDRSTRLEN] = "?";
                     inet_ntop(AF_INET, &from.sin_addr, ip, sizeof(ip));
-                    ls_dbg("响应来自 %s 的发现请求", ip);
+                    /*
+                     * 这里用 ls_log 而不是 ls_dbg：release 版里 ls_dbg 是
+                     * ((void)0)，整个消失。「客户端说发现不到服务端」时，
+                     * 第一个要回答的问题就是请求到底有没有到达服务端 ——
+                     * 打不出这行的话，两边都只能靠猜。
+                     * 发现请求是低频事件（客户端启动时发 3 次），但一个客户端
+                     * 有多个接口时源 IP 会交替出现，所以按 IP 各自限频 5 秒，
+                     * 而不是只记住「上一个」。
+                     */
+                    static char     seen_ip[8][INET_ADDRSTRLEN];
+                    static uint64_t seen_ms[8];
+                    uint64_t nowms = ls_now_ms();
+                    int slot = -1;
+                    int quiet = 0;
+                    for (int i = 0; i < 8; i++) {
+                        if (seen_ip[i][0] != '\0' && strcmp(seen_ip[i], ip) == 0) {
+                            slot = i;
+                            quiet = nowms - seen_ms[i] < 5000;
+                            break;
+                        }
+                        if (slot < 0 && seen_ip[i][0] == '\0') {
+                            slot = i;
+                        }
+                    }
+                    if (!quiet) {
+                        if (slot < 0) {
+                            slot = (int)(nowms % 8); /* 表满了就轮转覆盖 */
+                        }
+                        snprintf(seen_ip[slot], sizeof(seen_ip[slot]), "%s", ip);
+                        seen_ms[slot] = nowms;
+                        if (sr < 0) {
+                            ls_log("收到来自 %s 的发现请求，但回复失败：%s", ip,
+                                   strerror(errno));
+                        } else {
+                            ls_log("收到来自 %s 的发现请求，已回复（TCP 端口 %u）", ip, g_port);
+                        }
+                    }
                 }
             }
         }

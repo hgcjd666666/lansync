@@ -131,7 +131,14 @@ int  ls_tcp_listen(uint16_t port, int backlog);
 int  ls_tcp_connect(const char *host, uint16_t port);
 
 int  ls_udp_open(uint16_t port, int reuse);
-int  ls_udp_broadcast(int fd, uint16_t port, const char *text);
+/*
+ * 向各网段的广播地址各发一份，返回实际发出的份数。
+ * detail 非 NULL 时把发往的地址写进去（逗号分隔，发送失败的加后缀 "!"）。
+ * 「发现不到服务端」时第一个要查的就是广播到底发到哪去了——手机上接口一堆
+ * （wlan0/ap0/bt-pan/ccmni*），发错网段就等于没发。
+ */
+int  ls_udp_broadcast(int fd, uint16_t port, const char *text, char *detail,
+                      size_t detail_cap);
 uint64_t ls_now_ms(void);
 
 /* ---------------- 流 ---------------- */

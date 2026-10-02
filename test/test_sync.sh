@@ -87,6 +87,36 @@ assert_same_tree() {
     fi
 }
 
+# ---------------------------------------------------------------- 用例 0
+# 放在最前面：发现是客户端的第一步，它坏了后面所有 -s 之外的用法都走不通，
+# 而之前整套用例都用 -s 直连，等于完全没覆盖到这条路径。
+section "用例 0：局域网发现（UDP 广播）"
+SRV="$WORK/c0/srv"; CLI="$WORK/c0/cli"
+mkdir -p "$SRV" "$CLI"
+echo hi > "$SRV/hi.txt"
+
+start_server "$SRV"
+"$BIN" discover -w "$UDPPORT" -t 4000 >"$WORK/c0/disc.out" 2>&1
+
+if grep -q "一个都没发出去\|0 个地址" "$WORK/c0/disc.out"; then
+    echo "  (跳过：本机没有可广播的 IPv4 接口)"
+elif grep -q "testsrv" "$WORK/c0/disc.out"; then
+    ok "discover 能发现服务端"
+else
+    bad "discover 没发现服务端"; sed 's/^/       /' "$WORK/c0/disc.out"
+fi
+
+# 手机上有 wlan0/ap0/bt-pan 时同一服务端会从每个接口各回一份，只应列一次
+DUP=$(grep -c "名称=testsrv" "$WORK/c0/disc.out" 2>/dev/null)
+[ "${DUP:-0}" -le 1 ] && ok "同一服务端只列一次（不因多接口重复）" \
+    || bad "discover 列出了 $DUP 条重复"
+
+run_client "$CLI"
+grep -q "已连接" "$LASTCLIENT" && ok "client 不带 -s 也能自动发现并连上" \
+    || { bad "自动发现后没连上"; tail -6 "$LASTCLIENT" | sed 's/^/       /'; }
+[ -f "$CLI/hi.txt" ] && ok "自动发现后同步正常" || bad "文件没同步过来"
+stop_server
+
 # ---------------------------------------------------------------- 用例 1
 section "用例 1：双向合并（服务端优先）"
 SRV="$WORK/c1/srv"; CLI="$WORK/c1/cli"
