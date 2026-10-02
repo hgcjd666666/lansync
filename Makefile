@@ -25,13 +25,23 @@ CFLAGS     += -DLS_BUILD_TS=$(BUILD_TS) -DLS_BUILD_DATE='"$(BUILD_DATE)"'
 DEBUG_FLAGS := -DLS_DEBUG
 LDLIBS      ?= -pthread -lm -lz
 
+# 内容哈希用的 gxhash 静态库（Rust 编的，只含真正被引用的那一个 .o）。
+# 它是 aarch64 目标文件，所以别的架构不链它——src/hash.c 会退化成
+# 「哈希功能不可用」，程序照跑，只是 --verify hash 没效果。
+HASH_LIB :=
+ifeq ($(shell uname -m),aarch64)
+HASH_LIB := third_party/libgxhash_arm64.a
+else
+$(warning 当前架构不是 aarch64，内容哈希功能将不可用)
+endif
+
 STRIP ?= strip
 UPX   ?= upx
 
 SRCDIR    := src
 BUILDDIR  := build
 SRCS      := $(SRCDIR)/main.c $(SRCDIR)/common.c $(SRCDIR)/server.c $(SRCDIR)/client.c \
-             $(SRCDIR)/entropy.c
+             $(SRCDIR)/entropy.c $(SRCDIR)/hash.c
 
 OBJDIR     := $(BUILDDIR)/obj
 OBJDIR_DBG := $(BUILDDIR)/obj-dbg
@@ -46,11 +56,11 @@ BIN_DBG := $(BUILDDIR)/lansync_d
 # 纯 C 只依赖 bionic 的 libc/libdl/libm/libz（都是系统自带），动态链接即可。
 ANDROID_CLANG   ?= /r/ndk-min/bin/android-clang
 ANDROID_FLAGS   := -O2 -Wall -Wextra -std=c11 -D_GNU_SOURCE -pthread
-ANDROID_LIBS    := -lm -lz
+ANDROID_LIBS    := -lm -lz $(HASH_LIB)
 ANDROID_BIN     := $(BUILDDIR)/lansync-android-arm64
 ANDROID_BIN_DBG := $(BUILDDIR)/lansync-android-arm64-d
 
-.PHONY: all linux android test demo clean
+.PHONY: all linux android test test-hash demo clean
 
 # Linux 出调试版，Android 出发布版
 all: $(BIN_DBG) $(ANDROID_BIN)
@@ -65,9 +75,9 @@ $(OBJDIR_DBG)/%.o: $(SRCDIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(DEBUG_FLAGS) -MMD -MP -c -o $@ $<
 
-$(BIN_DBG): $(OBJS_DBG)
+$(BIN_DBG): $(OBJS_DBG) $(HASH_LIB)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(DEBUG_FLAGS) -o $@ $(OBJS_DBG) $(LDLIBS)
+	$(CC) $(CFLAGS) $(DEBUG_FLAGS) -o $@ $(OBJS_DBG) $(HASH_LIB) $(LDLIBS)
 	@echo "linux  调试版: $@  (`stat -c%s $@` 字节)"
 
 # ---------------- Linux 发布版（当前不需要，保留） ----------------
@@ -85,7 +95,7 @@ $(BIN_DBG): $(OBJS_DBG)
 
 # ---------------- Android 发布版 ----------------
 
-$(ANDROID_BIN): $(SRCS)
+$(ANDROID_BIN): $(SRCS) $(HASH_LIB)
 	@mkdir -p $(BUILDDIR)
 	$(ANDROID_CLANG) $(ANDROID_FLAGS) $(SRCS) -o $@ $(ANDROID_LIBS)
 	@$(STRIP) --strip-all $@
@@ -101,8 +111,22 @@ $(ANDROID_BIN): $(SRCS)
 
 # ---------------- 其他 ----------------
 
-test: $(BIN_DBG)
+test: $(BIN_DBG) test-hash
 	bash test/test_sync.sh
+
+# 用上游 is_stable 的原始期望值校验 third_party 里的 gxhash。
+# 整个内容哈希方案依赖「两端算出同一个值」，这条测试钉的就是那个前提。
+ifeq ($(HASH_LIB),)
+test-hash:
+	@echo "（当前架构不是 aarch64，跳过 gxhash 向量测试）"
+else
+test-hash: $(BUILDDIR)/hash-vectors
+	@$(BUILDDIR)/hash-vectors
+
+$(BUILDDIR)/hash-vectors: test/hash_vectors.c $(HASH_LIB)
+	@mkdir -p $(BUILDDIR)
+	$(CC) $(CFLAGS) -o $@ test/hash_vectors.c $(HASH_LIB)
+endif
 
 # 进度条渲染演示（不传输，只看效果）
 demo: $(BUILDDIR)/progress-demo

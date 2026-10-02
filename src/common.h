@@ -53,9 +53,10 @@ double ls_cfg_get(const char *json, const char *key, double def);
 enum {
     MSG_HELLO      = 1,  /* C->S {str name, str root, u32 proto, u64 build_ts, u8 mtime_ok} */
     MSG_HELLO_ACK  = 2,  /* S->C {str sname, str sroot, u32 proto, u8 prefer, u8 del,
-                                 str client_subdir} */
+                                 str client_subdir, u8 want_hash} */
     MSG_LIST_BEGIN = 3,  /* C->S {u32 total} */
-    MSG_LIST_CHUNK = 4,  /* C->S {u32 n, [str rel, u64 size, i64 mtime]...} */
+    MSG_LIST_CHUNK = 4,  /* C->S {u32 n, [str rel, u64 size, i64 mtime, u64 hash]...}
+                                 hash 为 0 表示这个条目的内容没算过 */
     MSG_LIST_END   = 5,  /* C->S {} */
     MSG_DELETE     = 6,  /* S->C {str rel} */
     MSG_LOG        = 7,  /* S->C {str text} */
@@ -179,6 +180,7 @@ typedef struct {
     char     *rel;   /* 相对 root 的路径，'/' 分隔 */
     uint64_t  size;
     int64_t   mtime; /* 纳秒精度：判定「有没有变」完全靠它 */
+    uint64_t  hash;  /* 内容哈希；0 表示「没算 / 算不了」，只能退回比大小 */
 } FileEntry;
 
 typedef struct {
@@ -189,11 +191,27 @@ typedef struct {
 void       flist_init(FileList *l);
 void       flist_free(FileList *l);
 FileEntry *flist_find(const FileList *l, const char *rel);
-int        flist_add(FileList *l, const char *rel, uint64_t size, int64_t mtime);
+int        flist_add(FileList *l, const char *rel, uint64_t size, int64_t mtime,
+                     uint64_t hash);
 void       flist_sort(FileList *l);
 
 /* 只 stat 不算内容哈希：几万个文件也很快 */
 int  fs_scan(const char *root, FileList *out, char *err, size_t errlen);
+
+/* ---------------- 内容哈希（gxhash） ---------------- */
+
+/*
+ * 判定「内容有没有变」本来只看 大小+修改时间，零读取。哈希是补前者的漏：
+ * 大小没变、时间戳又不可比（或不可信）时，只有读内容才发现得了。
+ *
+ * ls_hash_ok 是硬门槛：gxhash 直接用 ARMv8-A 的 aes 指令，CPU 没有就是
+ * 一条 SIGILL，所以启动时先问内核（AT_HWCAP），没有就让哈希功能整体缺席，
+ * 同步退回比大小，而不是崩掉。
+ */
+int ls_hash_ok(void);
+
+/* 算一个文件的内容哈希；成功返回 0 并写 *out，失败返回 -1（*out 不动） */
+int ls_hash_file(const char *path, uint64_t *out);
 
 /*
  * 采样文件开头若干字节，算香农熵（bit/byte，0~8）。

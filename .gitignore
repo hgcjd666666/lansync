@@ -5,3 +5,6 @@ build/
 
 # 测试/临时工作目录
 .tmp/
+
+# 服务端运行时写出的剖析/自动调参配置
+lansync-server.json

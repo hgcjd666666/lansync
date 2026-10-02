@@ -168,6 +168,7 @@ static int send_list(int fd, const FileList *l)
         buf_put_str(&items, l->v[i].rel);
         buf_put_u64(&items, l->v[i].size);
         buf_put_i64(&items, l->v[i].mtime);
+        buf_put_u64(&items, l->v[i].hash); /* 0 = 没算过 */
         in_batch++;
 
         if (in_batch >= LS_LIST_BATCH || items.len >= LS_LIST_BYTES) {
@@ -762,6 +763,7 @@ int client_main(int argc, char **argv)
 
     FileList local;
     flist_init(&local);
+    int want_hash = 0; /* 服务端要我们把这轮清单带上内容哈希 */
     Buf b;
     buf_init(&b);
     SyncStats stats;
@@ -798,6 +800,7 @@ int client_main(int argc, char **argv)
         char *subdir = rd_str(&r);
         uint64_t srv_ts = rd_u64(&r);
         char *srv_date = rd_str(&r);
+        uint8_t want_hash_wire = rd_u8(&r);
         if (r.err || proto != LS_PROTO) {
             ls_log("服务端协议版本不匹配");
             free(sname);
@@ -815,6 +818,7 @@ int client_main(int argc, char **argv)
                del ? " + 镜像删除" : "");
         free(sname);
         free(sroot);
+        want_hash = want_hash_wire ? 1 : 0;
 
         /*
          * 两端必须是同一次构建。不做向前兼容——版本不同就要么更新、要么退出，
@@ -894,6 +898,45 @@ int client_main(int argc, char **argv)
         ls_log("扫描完成：%zu 个文件，耗时 %llu ms", local.n,
                (unsigned long long)(ls_now_ms() - t0));
         prof_end("%zu 个文件", local.n);
+
+        /*
+         * 服务端要按内容比对。代价是把所有文件读一遍——这是哈希方案唯一
+         * 真正昂贵的地方（gxhash 本身 28 GB/s，磁盘顺序读才是瓶颈）。
+         * 读不了的文件哈希留 0，服务端会单独退回按元数据判。
+         */
+        if (want_hash) {
+            if (!ls_hash_ok()) {
+                ls_log("服务端要求按内容比对，但本机 CPU 没有 AES 指令：");
+                ls_log("gxhash 用不了，清单里哈希留空，服务端会退回按元数据判定。");
+            } else {
+                uint64_t hbytes = 0;
+                for (size_t i = 0; i < local.n; i++) {
+                    hbytes += local.v[i].size;
+                }
+                prof_begin("hash");
+                uint64_t h0 = ls_now_ms();
+                uint32_t hfail = 0;
+                progress_begin("计算哈希", hbytes, (uint32_t)local.n);
+                for (size_t i = 0; i < local.n; i++) {
+                    char full[LS_PATHMAX];
+                    if (path_join(full, sizeof(full), root, local.v[i].rel) != 0 ||
+                        ls_hash_file(full, &local.v[i].hash) != 0) {
+                        local.v[i].hash = 0; /* 读不了就留空，别拿垃圾值去比 */
+                        hfail++;
+                    }
+                    progress_add(local.v[i].size, 1);
+                }
+                char sm[160];
+                snprintf(sm, sizeof(sm), "%zu 个文件 / %llu ms%s", local.n,
+                         (unsigned long long)(ls_now_ms() - h0),
+                         hfail ? "（有读不了的）" : "");
+                progress_end(sm);
+                prof_end("%zu 个，%u 个读不了", local.n, hfail);
+                if (hfail > 0) {
+                    ls_log("有 %u 个文件读不了，它们这轮只能按元数据判", hfail);
+                }
+            }
+        }
 
         prof_begin("list_out");
         if (send_list(fd, &local) != 0) {

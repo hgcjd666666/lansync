@@ -48,10 +48,17 @@ start_server() {   # start_server <dir> [额外参数...]
     "$BIN" server -d "$dir" -p "$PORT" -w "$UDPPORT" -n testsrv --no-announce \
         --config "$WORK/prof.json" "$@" >"$LASTLOG" 2>&1 &
     SRV_PID=$!
-    sleep 0.4
-    if ! kill -0 "$SRV_PID" 2>/dev/null; then
-        echo "服务端启动失败:"; cat "$LASTLOG"; exit 1
-    fi
+    # 等它真的开始监听。只看进程活着不够：进程可能还在解析参数或扫目录，
+    # 这时候客户端连上去会失败——负载高时这个竞态真的会把用例打挂。
+    # 服务端 listen() 之后才会打「等待客户端连接」，拿它当就绪信号。
+    for _ in $(seq 1 200); do
+        grep -q "等待客户端连接" "$LASTLOG" 2>/dev/null && return 0
+        if ! kill -0 "$SRV_PID" 2>/dev/null; then
+            echo "服务端启动失败:"; cat "$LASTLOG"; exit 1
+        fi
+        sleep 0.05
+    done
+    echo "服务端 10 秒内没开始监听:"; cat "$LASTLOG"; exit 1
 }
 
 stop_server() {
@@ -392,7 +399,7 @@ grep -q "已压缩" "$WORK/c14/rnd.out" \
     || { bad "随机数据判定异常"; sed 's/^/       /' "$WORK/c14/rnd.out"; }
 
 # ---------------------------------------------------------------- 用例 15
-section "用例 15：客户端保不住 mtime 时，退化成只比大小（不再反复全量重传）"
+section "用例 15：客户端保不住 mtime 时改用内容哈希（同大小不同内容也认得出来）"
 SRV="$WORK/c15/srv"; CLI="$WORK/c15/cli"
 mkdir -p "$SRV" "$CLI"
 printf 'AAAA' > "$SRV/same-size.bin"; printf 'BBBB' > "$CLI/same-size.bin"
@@ -406,13 +413,15 @@ stop_server
 
 grep -q "无法保留文件修改时间" "$LASTCLIENT" && ok "客户端自检发现自己保不住 mtime 并告警" \
     || { bad "客户端没有告警"; tail -5 "$LASTCLIENT" | sed 's/^/       /'; }
-grep -q "退化为「只比大小」" "$LASTLOG" && ok "服务端据此切换策略" \
-    || { bad "服务端没切换策略"; grep "客户端接入" "$LASTLOG" | sed 's/^/       /'; }
-[ "$(cat "$CLI/same-size.bin")" = "BBBB" ] \
-    && ok "同大小不同内容被判为相同（退化模式的已知代价）" \
-    || bad "不该传的却传了"
+grep -q "改用内容哈希比对" "$LASTLOG" && ok "服务端据此改用内容哈希" \
+    || { bad "服务端没切到哈希"; grep "客户端接入" "$LASTLOG" | sed 's/^/       /'; }
+grep -q "内容哈希：0 个相同 / 1 个不同" "$LASTLOG" && ok "同大小但内容不同被哈希认出来" \
+    || { bad "哈希判定没生效"; grep "内容哈希" "$LASTLOG" | sed 's/^/       /'; }
+[ "$(cat "$CLI/same-size.bin")" = "AAAA" ] \
+    && ok "内容不同的文件被正确同步（旧行为是漏判成相同）" \
+    || bad "没同步过来，文件里是 $(cat "$CLI/same-size.bin")"
 [ -e "$CLI/only-s.txt" ] && ok "服务端独有的文件照常推送（首次同步不受影响）" \
-    || bad "退化后连该传的都没传"
+    || bad "该传的没传"
 
 # 再跑一次，确认收敛（不会每次全量重传）
 BEFORE=$(find "$CLI" -type f | wc -l)
@@ -423,6 +432,51 @@ stop_server
 grep -q "推送 0 / 拉取 0" "$LASTLOG" && ok "第二次同步不再重传任何文件（已收敛）" \
     || { bad "又重传了"; grep "同步结束" "$LASTLOG" | sed 's/^/       /'; }
 [ "$(find "$CLI" -type f | wc -l)" = "$BEFORE" ] && ok "文件数没变" || bad "文件数异常"
+
+# ---------------------------------------------------------------- 用例 15b
+section "用例 15b：CPU 没有 AES 时退回「只比大小」（用 LANSYNC_NO_HASH 假装）"
+SRV="$WORK/c15b/srv"; CLI="$WORK/c15b/cli"
+mkdir -p "$SRV" "$CLI"
+printf 'AAAA' > "$SRV/same-size.bin"; printf 'BBBB' > "$CLI/same-size.bin"
+
+export LANSYNC_NO_HASH=1
+start_server "$SRV" --keep-extra
+LANSYNC_FORCE_NO_MTIME=1 timeout 120 "$BIN" client -d "$CLI" -s 127.0.0.1 -p "$PORT" \
+    -n testcli >"$LASTCLIENT" 2>&1
+stop_server
+unset LANSYNC_NO_HASH
+
+grep -q "只能退化为「只比大小」" "$LASTLOG" && ok "服务端报出退化" \
+    || { bad "服务端没报退化"; grep "客户端接入" "$LASTLOG" | sed 's/^/       /'; }
+[ "$(cat "$CLI/same-size.bin")" = "BBBB" ] \
+    && ok "同大小不同内容判为相同（退化模式的已知代价）" \
+    || bad "不该传的却传了"
+
+# ---------------------------------------------------------------- 用例 15c
+section "用例 15c：--verify hash 强制按内容比对（元数据判定必然漏判的场景）"
+SRV="$WORK/c15c/srv"; CLI="$WORK/c15c/cli"
+mkdir -p "$SRV" "$CLI"
+# 同大小，且把 mtime 对齐到同一时刻：只看元数据一定判「相同」
+printf 'AAAA' > "$SRV/same.bin"; printf 'BBBB' > "$CLI/same.bin"
+touch -d '2020-01-01 00:00:00' "$SRV/same.bin" "$CLI/same.bin"
+
+start_server "$SRV" --keep-extra --verify hash
+run_client "$CLI"
+stop_server
+
+grep -q "按 --verify hash 比对内容" "$LASTLOG" && ok "服务端采纳 --verify hash" \
+    || { bad "选项没生效"; grep "客户端接入" "$LASTLOG" | sed 's/^/       /'; }
+grep -q "内容哈希：0 个相同 / 1 个不同" "$LASTLOG" && ok "同大小同 mtime、内容不同也被认出" \
+    || { bad "哈希没认出内容差异"; grep "内容哈希\|同步结束" "$LASTLOG" | sed 's/^/       /'; }
+[ "$(cat "$CLI/same.bin")" = "AAAA" ] && ok "文件被正确同步" \
+    || bad "没同步过来，文件里是 $(cat "$CLI/same.bin")"
+
+# 内容一致时，--verify hash 不该误报差异
+start_server "$SRV" --keep-extra --verify hash
+run_client "$CLI"
+stop_server
+grep -q "推送 0 / 拉取 0" "$LASTLOG" && ok "内容一致时不重传（哈希不乱报差异）" \
+    || { bad "误报差异"; grep "同步结束" "$LASTLOG" | sed 's/^/       /'; }
 
 # ---------------------------------------------------------------- 用例 16
 section "用例 16：压缩传输（auto 只看熵决定压不压）"

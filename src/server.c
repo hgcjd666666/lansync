@@ -45,6 +45,7 @@ static char              g_name[64] = "lansync-server";
 static int               g_prefer = PREFER_SERVER; /* 默认：客户端成为服务端副本 */
 static int               g_delete = 1;
 static int               g_allow_upload = 0; /* 默认服务端只读：不接受客户端写回 */
+static int               g_verify_hash = 0;  /* --verify hash：强制按内容比对 */
 static int               g_compress = LS_COMPRESS_AUTO;
 static char              g_dist[LS_PATHMAX] = {0};        /* 供 client update 拉取的程序 */
 static char              g_client_subdir[LS_PATHMAX] = {0}; /* 服务端指定的客户端落盘子目录 */
@@ -76,6 +77,13 @@ static void mode_str(mode_t m, char *out, size_t n)
     snprintf(out, n, "%s", b);
 }
 
+
+/* 本次接入要不要按内容比对：服务端点名要，或者客户端根本保不住 mtime。
+ * 前提是本机有 aes（gxhash 的硬要求），没有就只能退回元数据那一套。 */
+static int want_content_hash(const Client *c)
+{
+    return (g_verify_hash || !c->mtime_ok) && ls_hash_ok();
+}
 
 /* 服务端是否应该覆盖客户端 */
 static int server_wins(const FileEntry *loc, const FileEntry *rem)
@@ -179,13 +187,14 @@ static int recv_list(int fd, const Buf *begin, FileList *out)
             char *rel = rd_str(&rr);
             uint64_t size = rd_u64(&rr);
             int64_t mtime = rd_i64(&rr);
+            uint64_t hash = rd_u64(&rr);
             if (rr.err || !rel) {
                 free(rel);
                 buf_free(&c);
                 return -1;
             }
             if (path_safe(rel) && strlen(rel) < LS_PATHMAX) {
-                if (flist_add(out, rel, size, mtime) != 0) {
+                if (flist_add(out, rel, size, mtime, hash) != 0) {
                     free(rel);
                     buf_free(&c);
                     return -1;
@@ -484,6 +493,9 @@ static void do_sync(Client *c, const Buf *list_begin)
            local.n, c->mtime_ok ? "" : "（按大小比对）");
 
     uint32_t by_size = 0;
+    int      want_hash = want_content_hash(c);
+    uint32_t hashed = 0;      /* 靠内容哈希判为相同 */
+    uint32_t hashed_diff = 0; /* 靠内容哈希判为不同 */
 
     /*
      * 判定只看 大小 + 修改时间（都取纳秒），一个字节的内容都不读。
@@ -502,6 +514,36 @@ static void do_sync(Client *c, const Buf *list_begin)
             plan_add(&plan, le->rel, le->size, ACT_PUSH, "客户端缺失");
             continue;
         }
+
+        /*
+         * 内容哈希优先：大小相同、客户端也报了哈希时，它比时间戳可靠。
+         * 服务端这一侧是惰性算的——只有走到这里的文件才会被读一遍，
+         * 大小不同的文件在上面就被挡掉了，不会为了算哈希多读。
+         */
+        if (want_hash && le->size == re->size && re->hash != 0) {
+            if (le->hash == 0) {
+                char full[LS_PATHMAX];
+                if (path_join(full, sizeof(full), g_root, le->rel) == 0) {
+                    ls_hash_file(full, &le->hash); /* 失败就留 0，退回元数据判定 */
+                }
+            }
+            if (le->hash != 0) {
+                if (le->hash == re->hash) {
+                    c->st.same++;
+                    hashed++;
+                    ls_dbg("[%s] 相同（哈希）  %s", c->name, le->rel);
+                    continue;
+                }
+                if (server_wins(le, re)) {
+                    plan_add(&plan, le->rel, le->size, ACT_PUSH, "内容不同");
+                } else {
+                    plan_add(&plan, le->rel, le->size, ACT_PULL, "内容不同");
+                }
+                hashed_diff++;
+                continue;
+            }
+        }
+
         if (le->size == re->size) {
             if (!c->mtime_ok) {
                 /* 客户端保不住 mtime，时间戳没有可比性：只能按大小判 */
@@ -549,6 +591,9 @@ static void do_sync(Client *c, const Buf *list_begin)
     if (by_size > 0) {
         ls_log("[%s] 其中 %u 个文件只是大小相同就判为相同（客户端保不住 mtime，没能比对时间）",
                c->name, by_size);
+    }
+    if (hashed > 0 || hashed_diff > 0) {
+        ls_log("[%s] 内容哈希：%u 个相同 / %u 个不同", c->name, hashed, hashed_diff);
     }
 
     prof_begin("transfer");
@@ -642,7 +687,13 @@ static void *client_thread(void *arg)
     }
     ls_log("[%s] 客户端接入：%s，目录 %s", c->name, c->peer, c->remote_root);
     if (!c->mtime_ok) {
-        ls_log("[%s] 该设备无法保留文件修改时间，本次同步退化为「只比大小」", c->name);
+        if (ls_hash_ok()) {
+            ls_log("[%s] 该设备保不住 mtime，改用内容哈希比对（要读一遍它的文件）", c->name);
+        } else {
+            ls_log("[%s] 该设备保不住 mtime，本机又没 AES：只能退化为「只比大小」", c->name);
+        }
+    } else if (g_verify_hash && ls_hash_ok()) {
+        ls_log("[%s] 按 --verify hash 比对内容（两端都要把文件读一遍）", c->name);
     }
 
     /* 2. HELLO_ACK */
@@ -655,6 +706,7 @@ static void *client_thread(void *arg)
     buf_put_str(&b, g_client_subdir); /* 服务端指定客户端落盘的子目录，可空 */
     buf_put_u64(&b, ls_build_ts());   /* 构建时间戳，客户端据此判断要不要更新 */
     buf_put_str(&b, ls_build_date());
+    buf_put_u8(&b, (uint8_t)want_content_hash(c)); /* 要客户端把内容哈希一起报上来 */
     if (ls_msg_send(c->fd, MSG_HELLO_ACK, &b) != 0) {
         buf_free(&b);
         goto out;
@@ -827,6 +879,10 @@ static void usage(const char *prog, int debug)
     if (debug) {
         printf(
             "\n调试选项（--help-debug）\n"
+            "      --verify MODE        hash = 按内容比对（两端都读一遍文件，能发现\n"
+            "                           大小相同但内容不同的文件）；meta = 只比\n"
+            "                           大小+时间（默认）。客户端保不住 mtime 时\n"
+            "                           会自动转成 hash\n"
             "      --no-announce        不周期性广播自己（仍会应答发现请求）\n"
             "  -v, --verbose            连判定为相同的文件也打印\n"
             "  -q, --quiet              只打印错误\n");
@@ -838,7 +894,8 @@ static void usage(const char *prog, int debug)
 int server_main(int argc, char **argv)
 {
     enum { OPT_PREFER = 1000, OPT_KEEP, OPT_MERGE, OPT_NOANN, OPT_SUBDIR, OPT_DIST,
-           OPT_UPLOAD, OPT_COMPRESS, OPT_NOCOMPRESS, OPT_CONFIG, OPT_HDEBUG };
+           OPT_UPLOAD, OPT_COMPRESS, OPT_NOCOMPRESS, OPT_CONFIG, OPT_HDEBUG,
+           OPT_VERIFY };
     static const struct option opts[] = {
         {"dir", required_argument, 0, 'd'},
         {"port", required_argument, 0, 'p'},
@@ -851,6 +908,7 @@ int server_main(int argc, char **argv)
         {"config", required_argument, 0, OPT_CONFIG},
         {"compress", required_argument, 0, OPT_COMPRESS},
         {"no-compress", no_argument, 0, OPT_NOCOMPRESS},
+        {"verify", required_argument, 0, OPT_VERIFY},
         {"no-announce", no_argument, 0, OPT_NOANN},
         {"client-subdir", required_argument, 0, OPT_SUBDIR},
         {"dist", required_argument, 0, OPT_DIST},
@@ -901,6 +959,16 @@ int server_main(int argc, char **argv)
             }
             break;
         case OPT_NOCOMPRESS: g_compress = LS_COMPRESS_OFF; break;
+        case OPT_VERIFY:
+            if (strcmp(optarg, "hash") == 0) {
+                g_verify_hash = 1;
+            } else if (strcmp(optarg, "meta") == 0) {
+                g_verify_hash = 0;
+            } else {
+                fprintf(stderr, "--verify 只能是 hash / meta\n");
+                return 2;
+            }
+            break;
         case OPT_NOANN: g_announce = 0; break;
         case OPT_SUBDIR:
             if (!path_safe(optarg)) {

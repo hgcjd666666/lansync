@@ -69,21 +69,6 @@ static int term_cols(void)
     return 80;
 }
 
-static void fmt_eta(double secs, char *out, size_t cap)
-{
-    if (!(secs > 0) || secs > 86400) {
-        snprintf(out, cap, "--");
-        return;
-    }
-    int s = (int)secs;
-    if (s < 60) {
-        snprintf(out, cap, "%ds", s);
-    } else if (s < 3600) {
-        snprintf(out, cap, "%dm%02ds", s / 60, s % 60);
-    } else {
-        snprintf(out, cap, "%dh%02dm", s / 3600, (s % 3600) / 60);
-    }
-}
 
 /* 调用者必须已持有 g_io_lock */
 static void prog_erase_locked(void)
@@ -137,11 +122,7 @@ static void prog_draw_locked(int force)
             return;
         }
         g_prog_last_draw = now;
-        if (cols < 10) {
-            fprintf(stderr, "\r\033[K%3d%%", pct);
-        } else {
-            fprintf(stderr, "\r\033[K%s %3d%%", g_prog_label, pct);
-        }
+        fprintf(stderr, "\r\033[K%3d%%", pct);
         fflush(stderr);
         g_prog_dirty = 1;
         return;
@@ -158,19 +139,31 @@ static void prog_draw_locked(int force)
     double secs = (double)(now - g_prog_t0) / 1000.0;
     double speed = secs > 0.05 ? (double)g_prog_done / secs : 0;
     fmt_size((uint64_t)speed, sp, sizeof(sp));
-    fmt_eta(speed > 0 ? (double)(g_prog_total - g_prog_done) / speed : 0, eta, sizeof(eta));
+    /* 预计剩余时间只写秒数：省掉「剩」和单位，窄终端上能多留几列给数据 */
+    {
+        int eta_s = 0;
+        if (speed > 0 && g_prog_total > g_prog_done) {
+            eta_s = (int)((double)(g_prog_total - g_prog_done) / speed);
+        }
+        if (eta_s > 99999) {
+            eta_s = 99999;
+        }
+        snprintf(eta, sizeof(eta), "%d", eta_s);
+    }
 
     /* 后缀从详细到简略，挑第一个放得下的 */
     char tails[4][160];
-    snprintf(tails[0], sizeof(tails[0]), "  %s/%s  %s/s  剩 %s", d, t, sp, eta);
-    snprintf(tails[1], sizeof(tails[1]), "  %s/%s  剩 %s", d, t, eta);
+    /* 已完成就没必要显示剩余时间，免得结尾挂个语义不明的 0 */
+    int show_eta = (eta[0] && pct < 100 && speed > 0); /* 没有速度时算不出剩余时间 */
+    snprintf(tails[0], sizeof(tails[0]), show_eta ? "  %s/%s  %s/s  %s" : "  %s/%s  %s/s", d,
+             t, sp, eta);
+    snprintf(tails[1], sizeof(tails[1]), show_eta ? "  %s/%s  %s" : "  %s/%s", d, t, eta);
     snprintf(tails[2], sizeof(tails[2]), "  %s", d);
     tails[3][0] = '\0';
 
-    /* "推送 " (2 个汉字 = 4 列) + "[" + bar + "] " + "100%" */
-    const int label_cols = 4;
+    /* "[bar] 100% " —— 不写方向标签，省 5 列给进度条本身 */
     const int pct_cols = 4;
-    const int overhead = label_cols + 1 + 2 + pct_cols + 1; /* 标签+空格+[]+百分比+空格 */
+    const int overhead = 2 + pct_cols + 1;
 
     const char *tail = "";
     int bar_w = 0;
@@ -201,7 +194,7 @@ static void prog_draw_locked(int force)
     }
     bar[bar_w] = '\0';
 
-    fprintf(stderr, "\r\033[K%s [%s] %3d%%%s", g_prog_label, bar, pct, tail);
+    fprintf(stderr, "\r\033[K[%s] %3d%%%s", bar, pct, tail);
     fflush(stderr);
     g_prog_dirty = 1;
 }
@@ -1044,7 +1037,7 @@ void flist_free(FileList *l)
     l->n = l->cap = 0;
 }
 
-int flist_add(FileList *l, const char *rel, uint64_t size, int64_t mtime)
+int flist_add(FileList *l, const char *rel, uint64_t size, int64_t mtime, uint64_t hash)
 {
     if (l->n == l->cap) {
         size_t cap = l->cap ? l->cap * 2 : 64;
@@ -1062,6 +1055,7 @@ int flist_add(FileList *l, const char *rel, uint64_t size, int64_t mtime)
     }
     e->size = size;
     e->mtime = mtime;
+    e->hash = hash;
     l->n++;
     return 0;
 }
@@ -1134,9 +1128,10 @@ static int scan_one(const char *root, const char *rel, const char *name,
     }
 
     /* 只记录元数据，不读文件内容。mtime 用纳秒：秒级精度会让同一秒内
-     * 创建/修改的不同内容文件在快速路径上被误判为相同。 */
+     * 创建/修改的不同内容文件在快速路径上被误判为相同。
+     * hash 留 0：扫描默认零读取，要算内容哈希的场合自己扫完再补一遍。 */
     int64_t mt = (int64_t)st.st_mtim.tv_sec * 1000000000LL + (int64_t)st.st_mtim.tv_nsec;
-    if (flist_add(out, childrel, (uint64_t)st.st_size, mt) < 0) {
+    if (flist_add(out, childrel, (uint64_t)st.st_size, mt, 0) < 0) {
         snprintf(err, errlen, "内存不足");
         return -1;
     }
