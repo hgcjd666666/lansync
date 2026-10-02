@@ -8,6 +8,7 @@
 int server_main(int argc, char **argv);
 int client_main(int argc, char **argv);
 int discover_main(int argc, char **argv);
+int entropy_main(int argc, char **argv);
 
 static void usage(void)
 {
@@ -21,6 +22,7 @@ static void usage(void)
         "  client [-d DIR] [选项]    连接服务端，同步一次后退出（默认目录：当前目录）\n"
         "  client update [选项]      从服务端取回最新程序并替换自己\n"
         "  discover [选项]           搜索局域网内的服务端\n"
+        "  entropy DIR [选项]        看目录里有多少数据值得压缩\n"
         "\n"
         "示例\n"
         "  lansync server -d /srv/share          服务端；默认只读，客户端改不了它\n"
@@ -48,6 +50,9 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "discover") == 0) {
         return discover_main(argc - 1, argv + 1);
+    }
+    if (strcmp(cmd, "entropy") == 0) {
+        return entropy_main(argc - 1, argv + 1);
     }
     if (strcmp(cmd, "-h") == 0 || strcmp(cmd, "--help") == 0 || strcmp(cmd, "help") == 0) {
         usage();

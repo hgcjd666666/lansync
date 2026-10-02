@@ -8,14 +8,15 @@
 
 CC        ?= gcc
 CFLAGS    ?= -O2 -Wall -Wextra -std=c11 -D_GNU_SOURCE
-LDLIBS    ?= -pthread
+LDLIBS    ?= -pthread -lm
 
 SRCDIR    := src
 BUILDDIR  := build
 OBJDIR    := $(BUILDDIR)/obj
 BIN       := $(BUILDDIR)/lansync
 
-SRCS      := $(SRCDIR)/main.c $(SRCDIR)/common.c $(SRCDIR)/server.c $(SRCDIR)/client.c
+SRCS      := $(SRCDIR)/main.c $(SRCDIR)/common.c $(SRCDIR)/server.c $(SRCDIR)/client.c \
+             $(SRCDIR)/entropy.c
 OBJS      := $(SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
 DEPS      := $(OBJS:.o=.d)
 
@@ -25,6 +26,8 @@ DEPS      := $(OBJS:.o=.d)
 ANDROID_CLANG ?= /r/ndk-min/bin/android-clang
 ANDROID_BIN   := $(BUILDDIR)/lansync-android-arm64
 ANDROID_FLAGS := -O2 -Wall -Wextra -std=c11 -D_GNU_SOURCE -pthread
+# NDK 不默认链接数学库，entropy.c 用了 log()
+ANDROID_LIBS  := -lm
 
 .PHONY: all android test demo clean
 
@@ -43,7 +46,7 @@ android: $(ANDROID_BIN)
 
 $(ANDROID_BIN): $(SRCS)
 	@mkdir -p $(BUILDDIR)
-	$(ANDROID_CLANG) $(ANDROID_FLAGS) $(SRCS) -o $@
+	$(ANDROID_CLANG) $(ANDROID_FLAGS) $(SRCS) -o $@ $(ANDROID_LIBS)
 	@echo "构建完成（Android aarch64）：$@"
 
 test: $(BIN)

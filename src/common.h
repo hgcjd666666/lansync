@@ -170,6 +170,14 @@ void       flist_sort(FileList *l);
 /* 只 stat 不算内容哈希：几万个文件也很快 */
 int  fs_scan(const char *root, FileList *out, char *err, size_t errlen);
 
+/*
+ * 采样文件开头若干字节，算香农熵（bit/byte，0~8）。
+ * 用来判断「值不值得压」：< 6 基本是文本/日志/JSON，压缩收益大；
+ * > 7.5 基本是已压缩数据（jpg/mp4/zip/apk）或加密数据，再压白费 CPU。
+ * 返回 -1 表示文件读不了。
+ */
+double ls_entropy_file(const char *path, size_t sample_bytes);
+
 int  path_safe(const char *rel);                 /* 拒绝绝对路径 / ".." / 空段 */
 int  path_join(char *out, size_t n, const char *root, const char *rel);
 int  mkdirs_for(const char *fullpath);

@@ -372,6 +372,24 @@ cmp -s "$BIN" "$WORK/c13/out/got" && ok "取回的程序与服务端二进制逐
 [ -x "$WORK/c13/out/got" ] && ok "可执行位保留" || bad "丢了可执行位"
 grep -q "下发程序本体" "$LASTLOG" && ok "服务端记录了本次分发" || bad "服务端没有分发记录"
 
+# ---------------------------------------------------------------- 用例 14
+section "用例 14：entropy 能区分文本和随机数据（压缩判断的依据）"
+mkdir -p "$WORK/c14/txt" "$WORK/c14/rnd"
+for i in 1 2 3 4 5; do
+    printf '这是一段反复出现的文本内容，用来把熵值压低。\n%.0s' $(seq 1 200) > "$WORK/c14/txt/f$i.txt"
+done
+head -c 300000 /dev/urandom > "$WORK/c14/rnd/random.bin"
+
+"$BIN" entropy "$WORK/c14/txt" >"$WORK/c14/txt.out" 2>&1
+"$BIN" entropy "$WORK/c14/rnd" >"$WORK/c14/rnd.out" 2>&1
+
+grep -q "易压缩" "$WORK/c14/txt.out" && grep -q "5 个" "$WORK/c14/txt.out" \
+    && ok "文本目录的 5 个文件全部落进「易压缩」" \
+    || { bad "文本目录判定异常"; sed 's/^/       /' "$WORK/c14/txt.out"; }
+grep -q "已压缩" "$WORK/c14/rnd.out" \
+    && ok "随机数据落进「已压缩」（再压没意义）" \
+    || { bad "随机数据判定异常"; sed 's/^/       /' "$WORK/c14/rnd.out"; }
+
 # ---------------------------------------------------------------- 汇总
 printf '\n\033[1m========== 结果：%d 通过 / %d 失败 ==========\033[0m\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || { echo; echo "服务端日志:"; sed 's/^/  /' "$LASTLOG"; }

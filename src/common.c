@@ -11,6 +11,7 @@
 #include <net/if.h>
 #include <sys/ioctl.h>
 #include <netinet/in.h>
+#include <math.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -256,6 +257,47 @@ void progress_end(const char *summary)
 int progress_active(void)
 {
     return g_prog_active;
+}
+
+/* ======================= 熵 ======================= */
+
+double ls_entropy_file(const char *path, size_t sample_bytes)
+{
+    if (sample_bytes == 0) {
+        return -1;
+    }
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return -1;
+    }
+    uint8_t *buf = (uint8_t *)malloc(sample_bytes);
+    if (!buf) {
+        fclose(f);
+        return -1;
+    }
+    size_t n = fread(buf, 1, sample_bytes, f);
+    int bad = ferror(f);
+    fclose(f);
+    if (bad || n == 0) {
+        free(buf);
+        return n == 0 && !bad ? 0.0 : -1;
+    }
+
+    uint64_t cnt[256];
+    memset(cnt, 0, sizeof(cnt));
+    for (size_t i = 0; i < n; i++) {
+        cnt[buf[i]]++;
+    }
+    free(buf);
+
+    double h = 0.0;
+    for (int i = 0; i < 256; i++) {
+        if (cnt[i]) {
+            double p = (double)cnt[i] / (double)n;
+            h -= p * (log(p) / log(2.0));
+        }
+    }
+    return h;
 }
 
 /* ======================= 最近错误 ======================= */
