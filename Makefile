@@ -14,7 +14,7 @@ CFLAGS    ?= -O2 -Wall -Wextra -std=c11 -D_GNU_SOURCE
 BUILD_TS   := $(shell date +%s)
 BUILD_DATE := $(shell date '+%Y-%m-%d %H:%M:%S')
 CFLAGS     += -DLS_BUILD_TS=$(BUILD_TS) -DLS_BUILD_DATE='"$(BUILD_DATE)"'
-LDLIBS    ?= -pthread -lm
+LDLIBS    ?= -pthread -lm -lz
 
 SRCDIR    := src
 BUILDDIR  := build
@@ -33,7 +33,7 @@ ANDROID_CLANG ?= /r/ndk-min/bin/android-clang
 ANDROID_BIN   := $(BUILDDIR)/lansync-android-arm64
 ANDROID_FLAGS := -O2 -Wall -Wextra -std=c11 -D_GNU_SOURCE -pthread
 # NDK 不默认链接数学库，entropy.c 用了 log()
-ANDROID_LIBS  := -lm
+ANDROID_LIBS  := -lm -lz
 
 .PHONY: all android test demo clean
 

@@ -12,6 +12,7 @@
 #include <sys/ioctl.h>
 #include <netinet/in.h>
 #include <math.h>
+#include <zlib.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -1354,14 +1355,63 @@ void ls_sink_free(LsSink *s)
 
 /* ======================= bundle 传输 ======================= */
 
-int ls_send_bundle(int fd, const char *root, const BundleEntry *ents, size_t n,
+int ls_should_compress(const char *root, const BundleEntry *ents, size_t n, int mode)
+{
+    if (mode == LS_COMPRESS_ON) {
+        return 1;
+    }
+    if (mode == LS_COMPRESS_OFF) {
+        return 0;
+    }
+    double hsum = 0;
+    size_t cnt = 0;
+    for (size_t i = 0; i < n && cnt < 32; i++) {
+        if (ents[i].size < 512) {
+            continue; /* 太小的文件压不动，还白添压缩头 */
+        }
+        char full[LS_PATHMAX];
+        const char *p = ents[i].srcpath;
+        if (!p) {
+            if (!path_safe(ents[i].rel) ||
+                path_join(full, sizeof(full), root, ents[i].rel) < 0) {
+                continue;
+            }
+            p = full;
+        }
+        double h = ls_entropy_file(p, 8192);
+        if (h >= 0) {
+            hsum += h;
+            cnt++;
+        }
+    }
+    if (cnt == 0) {
+        return 0;
+    }
+    return (hsum / (double)cnt) < LS_COMPRESS_ENTROPY_MAX;
+}
+
+int ls_send_bundle(int fd, const char *root, const BundleEntry *ents, size_t n, int compress,
                    uint32_t *ok_n, uint32_t *failed_n, uint64_t *bytes)
 {
     Buf b;
     uint8_t *io = NULL;
-    uint64_t total = 0;
+    uint8_t *zbuf = NULL;
+    z_stream zs;
+    int zok = 0;
+    uint64_t total = 0;      /* 原始字节 */
+    uint64_t wire = 0;       /* 实际发出去的字节（压缩后） */
     uint32_t local_failed = 0;
     char first_local_err[512] = {0};
+
+    memset(&zs, 0, sizeof(zs));
+    if (compress && deflateInit(&zs, Z_DEFAULT_COMPRESSION) == Z_OK) {
+        zok = 1;
+        zbuf = (uint8_t *)malloc(LS_CHUNK);
+        if (!zbuf) {
+            deflateEnd(&zs);
+            zok = 0;
+        }
+    }
 
     uint64_t declared = 0;
     for (size_t i = 0; i < n; i++) {
@@ -1371,8 +1421,13 @@ int ls_send_bundle(int fd, const char *root, const BundleEntry *ents, size_t n,
     buf_init(&b);
     buf_put_u32(&b, (uint32_t)n);
     buf_put_u64(&b, declared);
+    buf_put_u8(&b, (uint8_t)(zok ? 1 : 0));
     if (ls_msg_send(fd, MSG_BUNDLE_BEGIN, &b) != 0) {
         buf_free(&b);
+        free(zbuf);
+        if (zok) {
+            deflateEnd(&zs);
+        }
         ls_set_last_error("发送 BUNDLE_BEGIN 失败: %s", strerror(errno));
         return -1;
     }
@@ -1380,11 +1435,18 @@ int ls_send_bundle(int fd, const char *root, const BundleEntry *ents, size_t n,
 
     io = (uint8_t *)malloc(LS_CHUNK);
     if (!io) {
+        free(zbuf);
+        if (zok) {
+            deflateEnd(&zs);
+        }
         ls_set_last_error("内存不足");
         return -1;
     }
 
-    for (size_t i = 0; i < n; i++) {
+    /* 把一块压缩输出发出去；返回 -1 表示发送失败 */
+    int send_pending = 0;
+
+    for (size_t i = 0; i < n && !send_pending; i++) {
         const BundleEntry *e = &ents[i];
         char full[LS_PATHMAX] = {0};
         char err[512] = {0};
@@ -1393,9 +1455,7 @@ int ls_send_bundle(int fd, const char *root, const BundleEntry *ents, size_t n,
             snprintf(full, sizeof(full), "%s", e->srcpath);
         } else if (!path_safe(e->rel) || path_join(full, sizeof(full), root, e->rel) < 0) {
             snprintf(err, sizeof(err), "路径非法或过长: %s", e->rel);
-            ls_dbg("跳过 %s：%s", e->rel, err);
             local_failed++;
-            /* 仍然发 ENTRY，接收端会因长度不符而丢弃，协议保持对齐 */
         }
 
         buf_init(&b);
@@ -1406,13 +1466,12 @@ int ls_send_bundle(int fd, const char *root, const BundleEntry *ents, size_t n,
         int rc = ls_msg_send(fd, MSG_BUNDLE_ENTRY, &b);
         buf_free(&b);
         if (rc < 0) {
-            free(io);
             ls_set_last_error("发送 BUNDLE_ENTRY 失败: %s", strerror(errno));
-            return -1;
+            send_pending = 1;
+            break;
         }
-
         if (err[0]) {
-            continue;
+            continue; /* 一个字节都不发，接收端会因长度不符丢弃 */
         }
 
         LsSource *src = ls_source_file(full, err, sizeof(err));
@@ -1420,45 +1479,96 @@ int ls_send_bundle(int fd, const char *root, const BundleEntry *ents, size_t n,
             if (!first_local_err[0]) {
                 snprintf(first_local_err, sizeof(first_local_err), "%s", err);
             }
-            ls_dbg("%s", err);
             ls_set_last_error("%s", err);
             local_failed++;
-            continue; /* 一个字节都不发，接收端会因长度不符丢弃这个条目 */
+            continue;
         }
 
         Buf d;
         buf_init(&d);
         ssize_t got;
-        int broken = 0;
         int readfail = 0;
+
         while ((got = src->read(src, io, LS_CHUNK)) > 0) {
-            buf_reset(&d);
-            buf_put_bytes(&d, io, (size_t)got);
-            if (ls_msg_send(fd, MSG_BUNDLE_DATA, &d) < 0) {
-                broken = 1;
+            if (zok) {
+                zs.next_in = io;
+                zs.avail_in = (uInt)got;
+                while (zs.avail_in > 0) {
+                    zs.next_out = zbuf;
+                    zs.avail_out = LS_CHUNK;
+                    if (deflate(&zs, Z_NO_FLUSH) == Z_STREAM_ERROR) {
+                        readfail = 1;
+                        break;
+                    }
+                    size_t produced = LS_CHUNK - zs.avail_out;
+                    if (produced) {
+                        buf_reset(&d);
+                        buf_put_bytes(&d, zbuf, produced);
+                        if (ls_msg_send(fd, MSG_BUNDLE_DATA, &d) < 0) {
+                            send_pending = 1;
+                            break;
+                        }
+                        wire += produced;
+                    }
+                }
+            } else {
+                buf_reset(&d);
+                buf_put_bytes(&d, io, (size_t)got);
+                if (ls_msg_send(fd, MSG_BUNDLE_DATA, &d) < 0) {
+                    send_pending = 1;
+                    break;
+                }
+                wire += (uint64_t)got;
+            }
+            if (send_pending || readfail) {
                 break;
             }
             total += (uint64_t)got;
             progress_add((uint64_t)got, 0);
         }
-        if (!broken && got < 0) {
+        if (!send_pending && !readfail && got < 0) {
             readfail = 1;
+        }
+
+        /* 条目收尾：flush 出本条目的全部压缩输出，边界才清晰 */
+        if (zok && !send_pending && !readfail) {
+            do {
+                zs.next_out = zbuf;
+                zs.avail_out = LS_CHUNK;
+                if (deflate(&zs, Z_SYNC_FLUSH) == Z_STREAM_ERROR) {
+                    readfail = 1;
+                    break;
+                }
+                size_t produced = LS_CHUNK - zs.avail_out;
+                if (produced) {
+                    buf_reset(&d);
+                    buf_put_bytes(&d, zbuf, produced);
+                    if (ls_msg_send(fd, MSG_BUNDLE_DATA, &d) < 0) {
+                        send_pending = 1;
+                        break;
+                    }
+                    wire += produced;
+                }
+            } while (zs.avail_out == 0);
         }
         buf_free(&d);
         ls_source_free(src);
 
         if (readfail) {
-            /* 已经发出去一部分，长度必然不符，接收端会丢弃这个条目 */
             ls_set_last_error("读取源文件中途失败: %s", e->rel);
             local_failed++;
         }
-        if (broken) {
-            free(io);
-            ls_set_last_error("发送数据失败: %s", strerror(errno));
-            return -1;
-        }
     }
     free(io);
+    free(zbuf);
+    if (zok) {
+        deflateEnd(&zs);
+    }
+
+    if (send_pending) {
+        ls_set_last_error("发送数据失败: %s", strerror(errno));
+        return -1;
+    }
 
     if (ls_msg_send(fd, MSG_BUNDLE_END, NULL) != 0) {
         ls_set_last_error("发送 BUNDLE_END 失败: %s", strerror(errno));
@@ -1483,6 +1593,10 @@ int ls_send_bundle(int fd, const char *root, const BundleEntry *ents, size_t n,
     free(msg);
     buf_free(&ack);
 
+    if (zok && total > 0 && wire > 0) {
+        ls_dbg("压缩：%llu -> %llu 字节（%.0f%%）", (unsigned long long)total,
+               (unsigned long long)wire, 100.0 * (double)wire / (double)total);
+    }
     if (local_failed > 0) {
         ls_log("本端有 %u 个文件读不了，例如：%s", local_failed,
                first_local_err[0] ? first_local_err : "(未知)");
@@ -1491,13 +1605,11 @@ int ls_send_bundle(int fd, const char *root, const BundleEntry *ents, size_t n,
         *ok_n = done;
     }
     if (failed_n) {
-        /* 接收端的失败数已包含发送端就失败的条目 */
         *failed_n = fail;
     }
     if (bytes) {
         *bytes = total;
     }
-    (void)local_failed;
     return ok ? 0 : -1;
 }
 
@@ -1523,6 +1635,7 @@ int ls_recv_bundle_body(int fd, const Buf *begin, LsSinkFactory mk, void *ctx,
     rd_init(&r, begin->p, begin->len);
     uint32_t count = rd_u32(&r);
     uint64_t declared = rd_u64(&r);
+    uint8_t compressed = rd_u8(&r);
     if (r.err || count > LS_MAX_FILES) {
         ls_set_last_error("bundle 起始报文损坏");
         return -1;
@@ -1534,6 +1647,30 @@ int ls_recv_bundle_body(int fd, const Buf *begin, LsSinkFactory mk, void *ctx,
         progress_begin("接收", declared, count);
     }
 
+    z_stream zs;
+    uint8_t *zbuf = NULL;
+    int zok = 0;
+    memset(&zs, 0, sizeof(zs));
+    if (compressed) {
+        if (inflateInit(&zs) != Z_OK) {
+            ls_set_last_error("无法初始化解压流");
+            if (own_progress) {
+                progress_end(NULL);
+            }
+            return -1;
+        }
+        zbuf = (uint8_t *)malloc(LS_CHUNK);
+        if (!zbuf) {
+            inflateEnd(&zs);
+            ls_set_last_error("内存不足");
+            if (own_progress) {
+                progress_end(NULL);
+            }
+            return -1;
+        }
+        zok = 1;
+    }
+
     uint32_t ok = 0, failed = 0;
     uint64_t total = 0;
     uint32_t seen = 0;
@@ -1543,21 +1680,49 @@ int ls_recv_bundle_body(int fd, const Buf *begin, LsSinkFactory mk, void *ctx,
     Buf b;
 
     /* 结算当前条目：写满了就 finish，否则丢弃 */
-#define SETTLE()                                                               \
-    do {                                                                       \
-        if (cur) {                                                             \
-            if (cur_failed || cur->finish(cur) != 0) {                         \
-                failed++;                                                      \
-                if (!first_err[0]) {                                           \
-                    snprintf(first_err, sizeof(first_err), "%s", ls_last_error()); \
-                }                                                              \
-            } else {                                                           \
-                ok++;                                                          \
-            }                                                                  \
-            ls_sink_free(cur);                                                 \
-            cur = NULL;                                                        \
-            cur_failed = 0;                                                    \
-        }                                                                      \
+#define SETTLE()                                                                    \
+    do {                                                                            \
+        if (cur) {                                                                  \
+            if (cur_failed || cur->finish(cur) != 0) {                              \
+                failed++;                                                           \
+                if (!first_err[0]) {                                                \
+                    snprintf(first_err, sizeof(first_err), "%s", ls_last_error());  \
+                }                                                                   \
+            } else {                                                                \
+                ok++;                                                               \
+            }                                                                       \
+            ls_sink_free(cur);                                                      \
+            cur = NULL;                                                             \
+            cur_failed = 0;                                                         \
+        }                                                                           \
+    } while (0)
+
+    /* 往当前汇里写 data；本地写不了就换成丢弃汇，保证流不错位 */
+#define FEED(data, len)                                                             \
+    do {                                                                            \
+        size_t _room = (size_t)(cur->expect - cur->written);                        \
+        size_t _take = (len) < _room ? (size_t)(len) : _room;                       \
+        if (_take > 0) {                                                            \
+            if (!cur_failed && cur->write(cur, (data), _take) != 0) {                \
+                if (!first_err[0]) {                                                \
+                    snprintf(first_err, sizeof(first_err), "%s", ls_last_error());  \
+                }                                                                   \
+                uint64_t _done = cur->written;                                      \
+                uint64_t _want = cur->expect;                                       \
+                cur->abort(cur);                                                    \
+                ls_sink_free(cur);                                                  \
+                cur = ls_sink_null(_want);                                          \
+                cur_failed = 1;                                                     \
+                if (cur) {                                                          \
+                    cur->written = _done + _take;                                   \
+                }                                                                   \
+            } else if (cur_failed) {                                                \
+                cur->written += _take;                                              \
+            }                                                                       \
+        }                                                                           \
+        if (cur && cur->written >= cur->expect) {                                   \
+            SETTLE();                                                               \
+        }                                                                           \
     } while (0)
 
     /*
@@ -1598,10 +1763,9 @@ int ls_recv_bundle_body(int fd, const Buf *begin, LsSinkFactory mk, void *ctx,
             if (!hdr_ok) {
                 free(rel);
                 ls_set_last_error("条目头损坏");
-                return -1;
+                goto fail_out;
             }
             if (seen >= count) {
-                /* 对端多发了条目：当作失败项继续读完它的数据 */
                 ls_dbg("bundle 收到超出声明数量的条目");
             }
             seen++;
@@ -1614,12 +1778,12 @@ int ls_recv_bundle_body(int fd, const Buf *begin, LsSinkFactory mk, void *ctx,
                              err[0] ? err : "无法创建目标文件");
                 }
                 cur = ls_sink_null(size);
-                cur_failed = 1; /* 数据照收但算失败 */
+                cur_failed = 1;
             }
             free(rel);
             if (!cur) {
                 ls_set_last_error("内存不足");
-                return -1;
+                goto fail_out;
             }
             if (size == 0) {
                 SETTLE(); /* 空文件没有数据段 */
@@ -1628,30 +1792,43 @@ int ls_recv_bundle_body(int fd, const Buf *begin, LsSinkFactory mk, void *ctx,
         }
 
         if (t == MSG_BUNDLE_DATA) {
-            if (cur) {
-                if (!cur_failed && cur->write(cur, b.p, b.len) != 0) {
-                    if (!first_err[0]) {
-                        snprintf(first_err, sizeof(first_err), "%s", ls_last_error());
+            if (cur || zok) {
+                if (zok) {
+                    zs.next_in = b.p;
+                    zs.avail_in = (uInt)b.len;
+                    int zbad = 0;
+                    while (zs.avail_in > 0) {
+                        zs.next_out = zbuf;
+                        zs.avail_out = LS_CHUNK;
+                        int zr = inflate(&zs, Z_NO_FLUSH);
+                        size_t produced = LS_CHUNK - zs.avail_out;
+                        if (produced > 0 && cur) {
+                            FEED(zbuf, produced);
+                            total += produced;
+                            progress_add(produced, 0);
+                        }
+                        if (zr == Z_STREAM_END) {
+                            break;
+                        }
+                        if (zr != Z_OK && zr != Z_BUF_ERROR) {
+                            zbad = 1;
+                            break;
+                        }
                     }
-                    /* 换成空汇，把剩下的数据读完，避免流错位 */
-                    uint64_t done = cur->written;
-                    uint64_t want = cur->expect;
-                    cur->abort(cur);
-                    ls_sink_free(cur);
-                    cur = ls_sink_null(want);
-                    cur->written = done;
-                    cur_failed = 1;
-                    if (cur) {
-                        (void)cur->write(cur, b.p, b.len); /* 只记账，内容丢弃 */
+                    if (zbad) {
+                        buf_free(&b);
+                        ls_set_last_error("解压失败（数据损坏或两端不一致）");
+                        goto fail_out;
                     }
-                } else if (cur_failed) {
-                    (void)cur->write(cur, b.p, b.len);
-                }
-                total += b.len;
-                progress_add(b.len, 0);
-                if (cur && cur->written >= cur->expect) {
-                    SETTLE();
-                    progress_add(0, 1);
+                } else if (cur) {
+                    size_t room = (size_t)(cur->expect - cur->written);
+                    if (b.len <= room) {
+                        FEED(b.p, b.len);
+                    } else {
+                        FEED(b.p, room); /* 超出部分丢弃 */
+                    }
+                    total += b.len;
+                    progress_add(b.len, 0);
                 }
             }
             buf_free(&b);
@@ -1666,12 +1843,7 @@ int ls_recv_bundle_body(int fd, const Buf *begin, LsSinkFactory mk, void *ctx,
 
         buf_free(&b);
         ls_set_last_error("bundle 中收到意外消息 %u", t);
-        if (cur) {
-            cur->abort(cur);
-            ls_sink_free(cur);
-            cur = NULL;
-        }
-        return -1;
+        goto fail_out;
     }
 
     SETTLE();
@@ -1693,11 +1865,24 @@ ack:
         buf_free(&ack);
         if (rc < 0) {
             ls_set_last_error("回执发送失败: %s", strerror(errno));
+            if (zok) {
+                inflateEnd(&zs);
+                free(zbuf);
+            }
+            if (own_progress) {
+                progress_end(NULL);
+            }
             return -1;
         }
     }
 
 #undef SETTLE
+#undef FEED
+
+    if (zok) {
+        inflateEnd(&zs);
+        free(zbuf);
+    }
 
     if (own_progress) {
         char buf[768];
@@ -1725,4 +1910,18 @@ ack:
         ls_set_last_error("%s", first_err);
     }
     return 0;
+
+fail_out:
+    if (cur) {
+        cur->abort(cur);
+        ls_sink_free(cur);
+    }
+    if (zok) {
+        inflateEnd(&zs);
+        free(zbuf);
+    }
+    if (own_progress) {
+        progress_end(NULL);
+    }
+    return -1;
 }

@@ -34,6 +34,11 @@
  */
 #define LS_MTIME_TOLERANCE_NS (2LL * 1000000000LL)
 
+/* 压缩模式 */
+enum { LS_COMPRESS_AUTO = 0, LS_COMPRESS_ON = 1, LS_COMPRESS_OFF = 2 };
+/* auto 模式下，采样平均熵低于这个值才压 */
+#define LS_COMPRESS_ENTROPY_MAX 6.5
+
 /* 一个 bundle 最多装多少字节 / 多少个条目，超过就切开 */
 #define LS_BUNDLE_BYTES (64ull * 1024 * 1024)
 #define LS_BUNDLE_FILES 2000
@@ -53,7 +58,7 @@ enum {
                                  u32 ignored, u64 bytes} */
     MSG_WANT_SELF  = 10, /* C->S {}  客户端索要服务端分发的程序本体 */
     /* ---- 流式传输：一个 bundle 里装若干文件，数据段是连续字节流 ---- */
-    MSG_BUNDLE_BEGIN = 17, /* {u32 count, u64 total_bytes} */
+    MSG_BUNDLE_BEGIN = 17, /* {u32 count, u64 total_bytes, u8 compressed} */
     MSG_BUNDLE_ENTRY = 18, /* {str rel, u64 size, i64 mtime, u32 mode} */
     MSG_BUNDLE_DATA  = 19, /* {bytes} 属于上一个 ENTRY 的内容 */
     MSG_BUNDLE_END   = 20, /* {} 一个 bundle 结束 */
@@ -213,8 +218,14 @@ typedef struct {
  * 协议不会错位，后面的条目照常。
  * ok_n / failed_n / bytes 可为 NULL。
  */
+/* compress 非 0 时整批走一个 deflate 流；每个条目结束会 flush，
+ * 保证「一个条目的数据解压后恰好是它的 size 字节」这个边界成立。 */
 int ls_send_bundle(int fd, const char *root, const BundleEntry *ents, size_t n,
-                   uint32_t *ok_n, uint32_t *failed_n, uint64_t *bytes);
+                   int compress, uint32_t *ok_n, uint32_t *failed_n, uint64_t *bytes);
+
+/* 采样估算这批值不值得压：auto 模式最多抽 32 个文件的前 8 KiB 算平均熵。
+ * 文本/日志/JSON 通常低于 6.5，值得压；jpg/mp4/zip 在 7.5 以上，压了白费 CPU。 */
+int ls_should_compress(const char *root, const BundleEntry *ents, size_t n, int mode);
 
 /* 接收端的落盘目标由工厂创建；工厂返回 NULL 表示该条目丢弃（计数为失败）。
  * ctx 由调用方定义。 */

@@ -280,7 +280,8 @@ static void handle_pull_want(int fd, const char *root, const Buf *req, PullStat 
     if (usable > 0) {
         uint32_t ok = 0, failed = 0;
         uint64_t bytes = 0;
-        int rc = ls_send_bundle(fd, root, ents, usable, &ok, &failed, &bytes);
+        int comp = ls_should_compress(root, ents, usable, LS_COMPRESS_AUTO);
+        int rc = ls_send_bundle(fd, root, ents, usable, comp, &ok, &failed, &bytes);
         if (rc == 0) {
             ls_dbg("上传 -> 服务端  %u 个文件", ok);
             out->pushed += ok;

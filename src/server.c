@@ -45,6 +45,7 @@ static char              g_name[64] = "lansync-server";
 static int               g_prefer = PREFER_SERVER; /* 默认：客户端成为服务端副本 */
 static int               g_delete = 1;
 static int               g_allow_upload = 0; /* 默认服务端只读：不接受客户端写回 */
+static int               g_compress = LS_COMPRESS_AUTO;
 static char              g_dist[LS_PATHMAX] = {0};        /* 供 client update 拉取的程序 */
 static char              g_client_subdir[LS_PATHMAX] = {0}; /* 服务端指定的客户端落盘子目录 */
 static uint16_t          g_port = LS_DEF_PORT;
@@ -263,11 +264,13 @@ static void push_batch(Client *c, PlanItem *items, size_t n)
     if (usable > 0) {
         uint32_t ok = 0, failed = 0;
         uint64_t bytes = 0;
-        int rc = ls_send_bundle(c->fd, g_root, ents, usable, &ok, &failed, &bytes);
+        int comp = ls_should_compress(g_root, ents, usable, g_compress);
+        int rc = ls_send_bundle(c->fd, g_root, ents, usable, comp, &ok, &failed, &bytes);
         char sz[32];
         fmt_size(bytes, sz, sizeof(sz));
         if (rc == 0) {
-            ls_dbg("[%s] 本批推送 %u 个文件，%s", c->name, ok, sz);
+            ls_dbg("[%s] 本批推送 %u 个文件，%s%s", c->name, ok, sz,
+                   comp ? "（已压缩）" : "");
         } else {
             /* 全部或部分失败都要让人看见，别只留一个计数器 */
             ls_log("[%s] 本批推送成功 %u / 失败 %u，%s", c->name, ok, failed,
@@ -540,7 +543,7 @@ static void send_self(Client *c)
 
     uint32_t ok = 0, failed = 0;
     uint64_t bytes = 0;
-    if (ls_send_bundle(c->fd, g_root, &e, 1, &ok, &failed, &bytes) == 0 && ok == 1) {
+    if (ls_send_bundle(c->fd, g_root, &e, 1, 0, &ok, &failed, &bytes) == 0 && ok == 1) {
         char sz[32];
         fmt_size(bytes, sz, sizeof(sz));
         ls_log("[%s] 下发程序本体 %s（%s）", c->name, resolved, sz);
@@ -755,6 +758,7 @@ static void usage(const char *prog, int debug)
         "      --keep-extra         不删除客户端多出的文件（默认会删）\n"
         "      --allow-upload       允许客户端把文件写回服务端（默认拒绝）\n"
         "      --merge              双向合并 = --prefer newer --keep-extra --allow-upload\n"
+        "      --compress MODE      传输压缩 auto(默认) | on | off\n"
         "\n"
         "网络\n"
         "  -p, --port PORT          TCP 端口（默认 %d）\n"
@@ -782,7 +786,7 @@ static void usage(const char *prog, int debug)
 int server_main(int argc, char **argv)
 {
     enum { OPT_PREFER = 1000, OPT_KEEP, OPT_MERGE, OPT_NOANN, OPT_SUBDIR, OPT_DIST,
-           OPT_UPLOAD, OPT_HDEBUG };
+           OPT_UPLOAD, OPT_COMPRESS, OPT_NOCOMPRESS, OPT_HDEBUG };
     static const struct option opts[] = {
         {"dir", required_argument, 0, 'd'},
         {"port", required_argument, 0, 'p'},
@@ -792,6 +796,8 @@ int server_main(int argc, char **argv)
         {"keep-extra", no_argument, 0, OPT_KEEP},
         {"merge", no_argument, 0, OPT_MERGE},
         {"allow-upload", no_argument, 0, OPT_UPLOAD},
+        {"compress", required_argument, 0, OPT_COMPRESS},
+        {"no-compress", no_argument, 0, OPT_NOCOMPRESS},
         {"no-announce", no_argument, 0, OPT_NOANN},
         {"client-subdir", required_argument, 0, OPT_SUBDIR},
         {"dist", required_argument, 0, OPT_DIST},
@@ -828,6 +834,19 @@ int server_main(int argc, char **argv)
             g_allow_upload = 1;
             break;
         case OPT_UPLOAD: g_allow_upload = 1; break;
+        case OPT_COMPRESS:
+            if (strcmp(optarg, "auto") == 0) {
+                g_compress = LS_COMPRESS_AUTO;
+            } else if (strcmp(optarg, "on") == 0) {
+                g_compress = LS_COMPRESS_ON;
+            } else if (strcmp(optarg, "off") == 0) {
+                g_compress = LS_COMPRESS_OFF;
+            } else {
+                fprintf(stderr, "--compress 只能是 auto / on / off\n");
+                return 2;
+            }
+            break;
+        case OPT_NOCOMPRESS: g_compress = LS_COMPRESS_OFF; break;
         case OPT_NOANN: g_announce = 0; break;
         case OPT_SUBDIR:
             if (!path_safe(optarg)) {

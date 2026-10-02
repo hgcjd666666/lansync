@@ -424,6 +424,38 @@ grep -q "推送 0 / 拉取 0" "$LASTLOG" && ok "第二次同步不再重传任�
     || { bad "又重传了"; grep "同步结束" "$LASTLOG" | sed 's/^/       /'; }
 [ "$(find "$CLI" -type f | wc -l)" = "$BEFORE" ] && ok "文件数没变" || bad "文件数异常"
 
+# ---------------------------------------------------------------- 用例 16
+section "用例 16：压缩传输（auto 只看熵决定压不压）"
+SRV="$WORK/c16/srv"; CLI="$WORK/c16/cli"
+mkdir -p "$SRV" "$CLI"
+# 低熵：重复文本 + 全零；高熵：随机数据
+yes "这是一段会重复非常多次的文本，用来把熵压得很低。" 2>/dev/null | head -c 2000000 > "$SRV/texty.log" || true
+head -c 500000 /dev/zero > "$SRV/zeros.bin"
+head -c 1500000 /dev/urandom > "$SRV/random.bin"
+
+start_server "$SRV" -v
+run_client "$CLI" >/dev/null
+stop_server
+
+assert_same_tree "$SRV" "$CLI" "压缩传输"
+grep -q "压缩：" "$LASTLOG" && ok "低熵内容触发了压缩" \
+    || { bad "没有压缩"; grep -E "推送 ->|同步结束" "$LASTLOG" | sed 's/^/       /'; }
+cmp -s "$SRV/random.bin" "$CLI/random.bin" && ok "高熵文件（压不动）也完整" || bad "随机文件损坏"
+cmp -s "$SRV/texty.log" "$CLI/texty.log" && ok "低熵文件解压后一致" || bad "文本文件损坏"
+
+# ---------------------------------------------------------------- 用例 17
+section "用例 17：--no-compress 时不压缩，内容依然正确"
+SRV="$WORK/c17/srv"; CLI="$WORK/c17/cli"
+mkdir -p "$SRV" "$CLI"
+yes "重复内容重复内容重复内容重复内容" 2>/dev/null | head -c 1000000 > "$SRV/a.log" || true
+
+start_server "$SRV" -v --no-compress
+run_client "$CLI" >/dev/null
+stop_server
+
+grep -q "（已压缩）" "$LASTLOG" && bad "指定不压却压了" || ok "--no-compress 生效，没有压缩"
+assert_same_tree "$SRV" "$CLI" "不压缩传输"
+
 # ---------------------------------------------------------------- 汇总
 printf '\n\033[1m========== 结果：%d 通过 / %d 失败 ==========\033[0m\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || { echo; echo "服务端日志:"; sed 's/^/  /' "$LASTLOG"; }
