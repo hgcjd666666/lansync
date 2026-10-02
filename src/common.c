@@ -3,6 +3,7 @@
  *
  */
 #include "common.h"
+#include "tls.h"
 
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -743,44 +744,26 @@ char *rd_str(Rd *r)
 
 /* ======================= socket ======================= */
 
+/*
+ * 所有 TCP 收发的唯一出口。这里**强制**要求 fd 上有 TLS 会话：
+ * 没登记就直接报错，而不是退回明文 —— 免得某处漏了握手却悄悄裸奔。
+ */
 int ls_send_all(int fd, const void *data, size_t len)
 {
-    const uint8_t *p = (const uint8_t *)data;
-    while (len > 0) {
-        ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return -1;
-        }
-        if (n == 0) {
-            return -1;
-        }
-        p += n;
-        len -= (size_t)n;
+    if (!ls_tls_registered(fd)) {
+        ls_set_last_error("fd %d 上没有 TLS 会话，拒绝明文发送", fd);
+        return -1;
     }
-    return 0;
+    return ls_tls_send(fd, data, len);
 }
 
 int ls_recv_all(int fd, void *data, size_t len)
 {
-    uint8_t *p = (uint8_t *)data;
-    while (len > 0) {
-        ssize_t n = recv(fd, p, len, 0);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return -1;
-        }
-        if (n == 0) {
-            return -1; /* 对端关闭 */
-        }
-        p += n;
-        len -= (size_t)n;
+    if (!ls_tls_registered(fd)) {
+        ls_set_last_error("fd %d 上没有 TLS 会话，拒绝接收", fd);
+        return -1;
     }
-    return 0;
+    return ls_tls_recv(fd, data, len);
 }
 
 /* 每线程复用的发送缓冲。256KB 的分片如果每条消息都 malloc/free，

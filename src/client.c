@@ -6,6 +6,7 @@
  *       然后按服务端指令完成一次同步，最后退出。
  */
 #include "common.h"
+#include "tls.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -185,6 +186,27 @@ static int discover_all(OfferList *out, uint16_t udp_port, int timeout_ms,
 }
 
 /*
+ * 连上并立刻完成 TLS 握手。任何一步失败都关掉返回 -1，原因在 ls_last_error()。
+ * 客户端所有 TCP 连接都必须走这里 —— 裸 connect 出来的 fd 在 ls_send_all 里
+ * 会被直接拒绝，所以漏了也传不出数据。
+ */
+static int dial(const char *ip, uint16_t port)
+{
+    int fd = ls_tcp_connect(ip, port);
+    if (fd < 0) {
+        ls_set_last_error("连接 %s:%u 失败：%s", ip, port, strerror(errno));
+        return -1;
+    }
+    char err[256];
+    if (ls_tls_connect(fd, err, sizeof(err)) != 0) {
+        ls_set_last_error("%s", err);
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/*
  * 依次尝试候选地址，返回第一个连上的连接，并把它的信息写进 chosen。
  * 必须都试：同一服务端的几个应答地址里，可能混着 tun0/VPN 这类本机有地址
  * 但对端不在上面的接口，先拿到哪个纯看包到达顺序。
@@ -192,7 +214,7 @@ static int discover_all(OfferList *out, uint16_t udp_port, int timeout_ms,
 static int connect_any(const OfferList *cands, Offer *chosen)
 {
     for (int i = 0; i < cands->n; i++) {
-        int fd = ls_tcp_connect(cands->v[i].ip, cands->v[i].port);
+        int fd = dial(cands->v[i].ip, cands->v[i].port);
         if (fd >= 0) {
             if (chosen) {
                 *chosen = cands->v[i];
@@ -201,7 +223,7 @@ static int connect_any(const OfferList *cands, Offer *chosen)
         }
         if (cands->n > 1) {
             ls_dbg("  连不上 %s:%u（%s），试下一个", cands->v[i].ip, cands->v[i].port,
-                   strerror(errno));
+                   ls_last_error());
         }
     }
     return -1;
@@ -655,9 +677,9 @@ static int client_update_main(int argc, char **argv)
     server_port = port;
     if (server && *server) {
         snprintf(server_ip, sizeof(server_ip), "%s", server);
-        fd = ls_tcp_connect(server_ip, server_port);
+        fd = dial(server_ip, server_port);
         if (fd < 0) {
-            ls_log("连接 %s:%u 失败：%s", server_ip, server_port, strerror(errno));
+            ls_log("%s", ls_last_error());
             return 1;
         }
     } else {
@@ -678,13 +700,11 @@ static int client_update_main(int argc, char **argv)
         ls_log("发现服务端「%s」%s:%u", chosen.name, chosen.ip, chosen.port);
     }
 
-    /* HELLO（update 不涉及目录，随便报一个） */
+    /* HELLO：只发版本信息。update 只取程序本体，不涉及目录与能力协商，
+     * 所以走完第一步握手就直接要程序 —— 不需要第二步握手。 */
     buf_init(&b);
-    buf_put_str(&b, myname);
-    buf_put_str(&b, ".");
     buf_put_u32(&b, LS_PROTO);
     buf_put_u64(&b, ls_build_ts());
-    buf_put_u8(&b, 1); /* update 不做同步判定，这个字段无意义 */
     if (ls_msg_send(fd, MSG_HELLO, &b) != 0) {
         buf_free(&b);
         goto done;
@@ -713,6 +733,7 @@ static int client_update_main(int argc, char **argv)
 
 done:
     if (fd >= 0) {
+        ls_tls_close(fd);
         close(fd);
     }
     return rc;
@@ -720,6 +741,14 @@ done:
 
 int client_main(int argc, char **argv)
 {
+    /* TLS 上下文：信任锚是编译进来的那张证书，不需要任何本地文件 */
+    {
+        char terr[256];
+        if (ls_tls_client_init(terr, sizeof(terr)) != 0) {
+            fprintf(stderr, "加密初始化失败：%s\n", terr);
+            return 1;
+        }
+    }
     if (argc > 1 && strcmp(argv[1], "update") == 0) {
         return client_update_main(argc - 1, argv + 1);
     }
@@ -817,9 +846,9 @@ int client_main(int argc, char **argv)
     int fd = -1;
     if (server && *server) {
         snprintf(server_ip, sizeof(server_ip), "%s", server);
-        fd = ls_tcp_connect(server_ip, server_port);
+        fd = dial(server_ip, server_port);
         if (fd < 0) {
-            ls_log("连接 %s:%u 失败：%s", server_ip, server_port, strerror(errno));
+            ls_log("%s", ls_last_error());
             return 1;
         }
     } else {
@@ -853,18 +882,17 @@ int client_main(int argc, char **argv)
 
     FileList local;
     flist_init(&local);
-    int want_hash = 0; /* 服务端要我们把这轮清单带上内容哈希 */
+    int hash_algo = LS_HASH_NONE; /* 服务端定的本轮哈希算法（两端必须一致） */
     Buf b;
     buf_init(&b);
     SyncStats stats;
     memset(&stats, 0, sizeof(stats));
 
-    /* 3. HELLO */
-    buf_put_str(&b, myname);
-    buf_put_str(&b, root);
+    /* 3. HELLO —— 只有版本信息。更新通道就在这一步，所以它是两端之间
+     *    最需要保持稳定的一条消息（见 common.h）。 */
+    buf_init(&b);
     buf_put_u32(&b, LS_PROTO);
     buf_put_u64(&b, ls_build_ts());
-    buf_put_u8(&b, (uint8_t)g_mtime_ok);
     if (ls_msg_send(fd, MSG_HELLO, &b) != 0) {
         ls_log("发送 HELLO 失败");
         rc = 1;
@@ -872,43 +900,28 @@ int client_main(int argc, char **argv)
     }
     buf_free(&b);
 
-    /* 4. HELLO_ACK */
+    /* 4. HELLO_ACK：版本一致就往下走，不一致就更新或退出 */
     buf_init(&b);
     if (ls_expect(fd, MSG_HELLO_ACK, &b) != 0) {
         ls_log("服务端没有正常应答");
+        buf_free(&b);
         rc = 1;
         goto out;
     }
     {
         Rd r;
         rd_init(&r, b.p, b.len);
-        char *sname = rd_str(&r);
-        char *sroot = rd_str(&r);
         uint32_t proto = rd_u32(&r);
-        uint8_t prefer = rd_u8(&r);
-        uint8_t del = rd_u8(&r);
-        char *subdir = rd_str(&r);
         uint64_t srv_ts = rd_u64(&r);
         char *srv_date = rd_str(&r);
-        uint8_t want_hash_wire = rd_u8(&r);
+        buf_free(&b);
+
         if (r.err || proto != LS_PROTO) {
             ls_log("服务端协议版本不匹配");
-            free(sname);
-            free(sroot);
-            free(subdir);
             free(srv_date);
             rc = 1;
             goto out;
         }
-        ls_log("服务端「%s」目录 %s，策略 %s%s", sname ? sname : "?",
-               sroot ? sroot : "?",
-               prefer == PREFER_SERVER
-                   ? "服务端优先"
-                   : (prefer == PREFER_CLIENT ? "客户端优先" : "新者优先"),
-               del ? " + 镜像删除" : "");
-        free(sname);
-        free(sroot);
-        want_hash = want_hash_wire ? 1 : 0;
 
         /*
          * 两端必须是同一次构建。不做向前兼容——版本不同就要么更新、要么退出，
@@ -957,6 +970,63 @@ int client_main(int argc, char **argv)
             goto out;
         }
         free(srv_date);
+    }
+
+    /* 5. HELLO2 —— 第二步握手：能力协商 */
+    buf_init(&b);
+    buf_put_str(&b, myname);
+    buf_put_str(&b, root);
+    buf_put_u8(&b, (uint8_t)g_mtime_ok);
+    /* 报上本机有没有 AES：服务端据此决定两端统一用 gxhash 还是 SHA3-256。
+     * 不报的话一端 gxhash 一端 SHA3，同一文件两边算出的值没法比。 */
+    buf_put_u8(&b, (uint8_t)ls_gxhash_ok());
+    if (ls_msg_send(fd, MSG_HELLO2, &b) != 0) {
+        ls_log("发送能力协商失败");
+        buf_free(&b);
+        rc = 1;
+        goto out;
+    }
+    buf_free(&b);
+
+    /* 6. HELLO2_ACK —— 服务端的策略与本轮哈希算法 */
+    buf_init(&b);
+    if (ls_expect(fd, MSG_HELLO2_ACK, &b) != 0) {
+        ls_log("服务端没有应答能力协商");
+        buf_free(&b);
+        rc = 1;
+        goto out;
+    }
+    {
+        Rd r;
+        rd_init(&r, b.p, b.len);
+        char *sname = rd_str(&r);
+        char *sroot = rd_str(&r);
+        uint8_t prefer = rd_u8(&r);
+        uint8_t del = rd_u8(&r);
+        char *subdir = rd_str(&r);
+        uint8_t hash_wire = rd_u8(&r);
+        buf_free(&b);
+
+        if (r.err || !sname || !sroot) {
+            ls_log("能力协商报文错误");
+            free(sname);
+            free(sroot);
+            free(subdir);
+            rc = 1;
+            goto out;
+        }
+
+        ls_log("服务端「%s」目录 %s，策略 %s%s", sname, sroot,
+               prefer == PREFER_SERVER
+                   ? "服务端优先"
+                   : (prefer == PREFER_CLIENT ? "客户端优先" : "新者优先"),
+               del ? " + 镜像删除" : "");
+        free(sname);
+        free(sroot);
+
+        hash_algo = (hash_wire == LS_HASH_GXHASH) ? LS_HASH_GXHASH
+                   : (hash_wire == LS_HASH_SHA3)   ? LS_HASH_SHA3
+                                                   : LS_HASH_NONE;
 
         /* 服务端可以强制指定客户端把文件落在哪个子目录下 */
         if (subdir && *subdir && path_safe(subdir)) {
@@ -971,7 +1041,6 @@ int client_main(int argc, char **argv)
         }
         free(subdir);
     }
-    buf_free(&b);
 
     /* 5. 扫描本地并上报清单 */
     {
@@ -994,11 +1063,12 @@ int client_main(int argc, char **argv)
          * 真正昂贵的地方（gxhash 本身 28 GB/s，磁盘顺序读才是瓶颈）。
          * 读不了的文件哈希留 0，服务端会单独退回按元数据判。
          */
-        if (want_hash) {
-            if (!ls_hash_ok()) {
-                ls_log("服务端要求按内容比对，但本机 CPU 没有 AES 指令：");
-                ls_log("gxhash 用不了，清单里哈希留空，服务端会退回按元数据判定。");
-            } else {
+        if (hash_algo != LS_HASH_NONE) {
+            if (hash_algo == LS_HASH_SHA3) {
+                ls_log("本机没有 AES 指令，本轮按 SHA3-256 比对内容（纯软件，%s）",
+                       ls_gxhash_ok() ? "两端取其一" : "服务端也这么定");
+            }
+            {
                 uint64_t hbytes = 0;
                 for (size_t i = 0; i < local.n; i++) {
                     hbytes += local.v[i].size;
@@ -1010,7 +1080,7 @@ int client_main(int argc, char **argv)
                 for (size_t i = 0; i < local.n; i++) {
                     char full[LS_PATHMAX];
                     if (path_join(full, sizeof(full), root, local.v[i].rel) != 0 ||
-                        ls_hash_file(full, &local.v[i].hash) != 0) {
+                        ls_hash_file_algo(full, hash_algo, &local.v[i].hash) != 0) {
                         local.v[i].hash = 0; /* 读不了就留空，别拿垃圾值去比 */
                         hfail++;
                     }
@@ -1069,6 +1139,30 @@ int client_main(int argc, char **argv)
             continue;
         }
 
+        if (t == MSG_UPLOAD_CODE) {
+            /*
+             * 服务端要收文件，先把验证码送下来让我们显示。
+             * 显示在这里、输入在服务端 —— 两边都看得到的人才能批准这次写入。
+             */
+            Rd r;
+            rd_init(&r, b.p, b.len);
+            char *code = rd_str(&r);
+            if (!r.err && code != NULL) {
+                /* 用 stderr：进度条画在 stderr 上，这里别和它抢同一行 */
+                fprintf(stderr, "\n");
+                fprintf(stderr, "  ┌──────────────────────────────┐\n");
+                fprintf(stderr, "  │  服务端要接收文件            │\n");
+                fprintf(stderr, "  │  请在服务端输入这个验证码：  │\n");
+                fprintf(stderr, "  │                              │\n");
+                fprintf(stderr, "  │        %s                  │\n", code);
+                fprintf(stderr, "  │                              │\n");
+                fprintf(stderr, "  └──────────────────────────────┘\n");
+                fflush(stderr);
+            }
+            free(code);
+            buf_free(&b);
+            continue;
+        }
         if (t == MSG_PULL_WANT) {
             PullStat ps;
             memset(&ps, 0, sizeof(ps));
@@ -1178,6 +1272,7 @@ out:
     flist_free(&local);
     prof_finish(&prof, g_profile_path);
     prof_bind(NULL);
+    ls_tls_close(fd);
     close(fd);
     return rc;
 }

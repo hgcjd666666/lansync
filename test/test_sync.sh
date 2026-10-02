@@ -46,7 +46,7 @@ start_server() {   # start_server <dir> [额外参数...]
     LASTLOG="$WORK/server-$RUN.log"
     LASTCLIENT="$WORK/client-$RUN.log"
     "$BIN" server -d "$dir" -p "$PORT" -w "$UDPPORT" -n testsrv --no-announce \
-        --config "$WORK/prof.json" "$@" >"$LASTLOG" 2>&1 &
+        --config "$WORK/prof.json" "$@" >"$LASTLOG" 2>&1 </dev/null &
     SRV_PID=$!
     # 等它真的开始监听。只看进程活着不够：进程可能还在解析参数或扫目录，
     # 这时候客户端连上去会失败——负载高时这个竞态真的会把用例打挂。
@@ -226,7 +226,7 @@ echo "original" > "$VICTIM"
 
 start_server "$SRV"
 python3 - "$PORT" "$WORK/c5" <<'PYEOF'
-import socket, struct, sys, os
+import socket, ssl, struct, sys, os
 port = int(sys.argv[1]); base = sys.argv[2]
 
 def s(x):
@@ -235,12 +235,20 @@ def s(x):
 def frame(t, payload=b''):
     return struct.pack('>BI', t, len(payload)) + payload
 
-sk = socket.create_connection(('127.0.0.1', port), timeout=5)
-# HELLO：协议字段要与当前版本一致（proto, build_ts, mtime_ok）
-sk.sendall(frame(1, s('evil') + s(base) + struct.pack('>I', 1) +
-                 struct.pack('>Q', 0) + struct.pack('>B', 1)))
-# 读 HELLO_ACK
-hdr = sk.recv(5)
+# 服务端只收 TLS 连接，所以这个「恶意客户端」也得先握手。
+# 它当然不校验服务端身份（本来就是来干坏事的）—— 要测的是握手之后
+# 服务端会不会挡住路径穿越，而不是它能不能否认服务端身份。
+raw = socket.create_connection(('127.0.0.1', port), timeout=5)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+sk = ctx.wrap_socket(raw, server_hostname='lansync-server')
+# 第一步握手：HELLO 只带协议号和构建时间戳
+sk.sendall(frame(1, struct.pack('>I', 1) + struct.pack('>Q', 0)))
+sk.recv(5)  # HELLO_ACK
+# 第二步握手：能力协商（name, root, mtime_ok, has_aes）
+sk.sendall(frame(25, s('evil') + s(base) + struct.pack('>B', 1) + struct.pack('>B', 1)))
+sk.recv(5)  # HELLO2_ACK
 # LIST_BEGIN + 一条含路径穿越的条目 + LIST_END
 entries = b''
 for bad in ['../VICTIM.txt', '../../etc/lansync_pwned', '/tmp/abs_pwned']:
@@ -475,7 +483,7 @@ grep -q "推送 0 / 拉取 0" "$LASTLOG" && ok "第二次同步不再重传任�
 [ "$(find "$CLI" -type f | wc -l)" = "$BEFORE" ] && ok "文件数没变" || bad "文件数异常"
 
 # ---------------------------------------------------------------- 用例 15b
-section "用例 15b：CPU 没有 AES 时退回「只比大小」（用 LANSYNC_NO_HASH 假装）"
+section "用例 15b：一端没有 AES 时改用纯软件 SHA3-256（用 LANSYNC_NO_HASH 假装）"
 SRV="$WORK/c15b/srv"; CLI="$WORK/c15b/cli"
 mkdir -p "$SRV" "$CLI"
 printf 'AAAA' > "$SRV/same-size.bin"; printf 'BBBB' > "$CLI/same-size.bin"
@@ -487,11 +495,13 @@ LANSYNC_FORCE_NO_MTIME=1 timeout 120 "$BIN" client -d "$CLI" -s 127.0.0.1 -p "$P
 stop_server
 unset LANSYNC_NO_HASH
 
-grep -q "只能退化为「只比大小」" "$LASTLOG" && ok "服务端报出退化" \
-    || { bad "服务端没报退化"; grep "客户端接入" "$LASTLOG" | sed 's/^/       /'; }
-[ "$(cat "$CLI/same-size.bin")" = "BBBB" ] \
-    && ok "同大小不同内容判为相同（退化模式的已知代价）" \
-    || bad "不该传的却传了"
+grep -q "改用内容哈希比对：SHA3-256" "$LASTLOG" && ok "服务端改用 SHA3-256（不依赖 AES）" \
+    || { bad "没有改用 SHA3"; grep "按内容比对" "$LASTLOG" | sed 's/^/       /'; }
+grep -q "内容哈希：0 个相同 / 1 个不同" "$LASTLOG" \
+    && ok "同大小不同内容被认出（不再退化成只比大小）" \
+    || { bad "没认出内容差异"; grep "内容哈希" "$LASTLOG" | sed 's/^/       /'; }
+[ "$(cat "$CLI/same-size.bin")" = "AAAA" ] && ok "差异被同步（服务端版本覆盖客户端）" \
+    || bad "客户端文件是「$(cat "$CLI/same-size.bin")」"
 
 # ---------------------------------------------------------------- 用例 15c
 section "用例 15c：--verify hash 强制按内容比对（元数据判定必然漏判的场景）"
@@ -550,6 +560,90 @@ stop_server
 
 grep -q "（已压缩）" "$LASTLOG" && bad "指定不压却压了" || ok "--no-compress 生效，没有压缩"
 assert_same_tree "$SRV" "$CLI" "不压缩传输"
+
+# ---------------------------------------------------------------- 用例 18
+section "用例 18：写回服务端要过六位验证码（服务端下发 -> 客户端显示 -> 服务端输入）"
+# 这里自己管服务端：它的 stdin 要能被喂一行码，模拟操作者看着客户端屏幕敲进去。
+auth_case() {   # auth_case <子目录> <喂进去的码> <期望的服务端文件内容>
+    local tag=$1 fed=$2 want=$3
+    local srv="$WORK/$tag/srv" cli="$WORK/$tag/cli"
+    rm -rf "$WORK/$tag"; mkdir -p "$srv" "$cli"
+    # 两边内容**长度不同**，才会被判为「大小不同」而产生写回需求。
+    # 用同样长度的字符串是不行的：大小一样、mtime 又落在 2 秒容差内，会被判相同。
+    echo "server version" > "$srv/a.txt"
+    echo "client version, definitely longer" > "$cli/a.txt"
+
+    # 延迟 1 秒再喂：先让客户端把码显示出来，再「有人输入」，贴近真实时序
+    { sleep 1; echo "$fed"; } | "$BIN" server -d "$srv" -p "$PORT" -w "$UDPPORT" \
+        -n testsrv --no-announce --config "$WORK/prof.json" --prefer client \
+        --code 424242 >"$WORK/$tag-srv.log" 2>&1 &
+    SRV_PID=$!
+    for _ in $(seq 1 200); do
+        grep -q "等待客户端连接" "$WORK/$tag-srv.log" 2>/dev/null && break
+        sleep 0.05
+    done
+
+    timeout 60 "$BIN" client -d "$cli" -s 127.0.0.1 -p "$PORT" -n testcli \
+        >"$WORK/$tag-cli.log" 2>&1
+    kill "$SRV_PID" 2>/dev/null
+    wait "$SRV_PID" 2>/dev/null
+    SRV_PID=""
+    LASTLOG="$WORK/$tag-srv.log"
+    [ "$(cat "$srv/a.txt")" = "$want" ]
+}
+
+auth_case c18 424242 "client version, definitely longer" \
+    && ok "码正确 -> 客户端写回成功" || bad "码正确却没写进去"
+grep -q "424242" "$WORK/c18-cli.log" && ok "客户端把验证码显示出来了" \
+    || bad "客户端没有显示验证码"
+grep -q "验证码正确" "$LASTLOG" && ok "服务端记录了授权" || bad "服务端没记录授权"
+
+auth_case c18b 000000 "server version" \
+    && ok "码不对 -> 拒绝写入" || bad "码不对却写进去了！"
+grep -q "验证码不匹配" "$LASTLOG" && ok "服务端记录了拒绝" || bad "服务端没记录拒绝"
+
+# ---------------------------------------------------------------- 用例 19
+section "用例 19：HELLO 只放版本信息（更新通道的稳定入口）"
+# 两步握手把「版本检查」和「能力协商」分开了：HELLO/HELLO_ACK 只放版本信息，
+# 以后加能力字段都加到 HELLO2 上，碰不到更新通道。
+# 这条用例钉住这个约定：**里塞了多余字段的老客户端必须被容忍**（多余部分忽略），
+# 而不是被拒连 —— 被拒连就等于它再也更新不了自己。
+SRV="$WORK/c19/srv"; mkdir -p "$SRV"
+start_server "$SRV"
+python3 - "$PORT" <<'PYEOF'
+import socket, ssl, struct, sys
+port = int(sys.argv[1])
+
+def s(x):
+    b = x.encode()
+    return struct.pack('>I', len(b)) + b
+
+def frame(t, payload=b''):
+    return struct.pack('>BI', t, len(payload)) + payload
+
+raw = socket.create_connection(('127.0.0.1', port), timeout=5)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+sk = ctx.wrap_socket(raw, server_hostname='lansync-server')
+
+# HELLO = proto + build_ts，后面还跟了一堆旧版本才有 / 将来才有的字段。
+# build_ts 给 0，模拟「不是同一次构建」——这正是要走更新通道的情形。
+sk.sendall(frame(1, struct.pack('>I', 1) + struct.pack('>Q', 0) +
+                 s('extra-name') + s('/tmp/oldcli') + b'\x01\x01'))
+hdr = sk.recv(5)
+sk.close()
+sys.exit(0 if len(hdr) == 5 and hdr[0] == 2 else 1)
+PYEOF
+RC=$?
+stop_server
+
+[ "$RC" -eq 0 ] && ok "带多余字段的 HELLO 仍收到 HELLO_ACK" \
+    || bad "被拒连了 —— 这样的客户端会永远更新不了自己"
+grep -q "HELLO 报文错误" "$LASTLOG" && bad "服务端把多余字段当成了错误" \
+    || ok "多余字段被忽略，不算报文错误"
+grep -q "构建时间戳不同" "$LASTLOG" && ok "仍识别出「不是同一次构建」（更新通道的触发条件）" \
+    || bad "没识别出构建时间戳差异"
 
 # ---------------------------------------------------------------- 汇总
 printf '\n\033[1m========== 结果：%d 通过 / %d 失败 ==========\033[0m\n' "$PASS" "$FAIL"

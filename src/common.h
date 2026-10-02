@@ -51,9 +51,18 @@ double ls_cfg_get(const char *json, const char *key, double def);
 
 /* ---------------- 消息类型 ---------------- */
 enum {
-    MSG_HELLO      = 1,  /* C->S {str name, str root, u32 proto, u64 build_ts, u8 mtime_ok} */
-    MSG_HELLO_ACK  = 2,  /* S->C {str sname, str sroot, u32 proto, u8 prefer, u8 del,
-                                 str client_subdir, u8 want_hash} */
+    /*
+     * 握手分两步，为的是把「版本检查」和「能力协商」分开。
+     *
+     * HELLO/HELLO_ACK 是**更新通道的入口**：两端构建不一致时，客户端要沿着这同一条
+     * 连接把新程序取回来。所以这两条消息只放版本信息，**格式必须永远稳定** ——
+     * 一旦往里加字段，老客户端就会因为解析失败被拒连，从此再也更新不了自己。
+     *
+     * 其余一切「能力」都放 HELLO2/HELLO2_ACK：那边随便加字段，只是能力协商失败，
+     * 不会连累更新通道。
+     */
+    MSG_HELLO      = 1,  /* C->S {u32 proto, u64 build_ts} —— 就这两个，别再加 */
+    MSG_HELLO_ACK  = 2,  /* S->C {u32 proto, u64 build_ts, str build_date} */
     MSG_LIST_BEGIN = 3,  /* C->S {u32 total} */
     MSG_LIST_CHUNK = 4,  /* C->S {u32 n, [str rel, u64 size, i64 mtime, u64 hash]...}
                                  hash 为 0 表示这个条目的内容没算过 */
@@ -71,9 +80,16 @@ enum {
     MSG_BUNDLE_END   = 20, /* {} 一个 bundle 结束 */
     MSG_BUNDLE_ACK   = 21, /* {u8 ok, str msg, u32 done, u32 failed} */
     MSG_PULL_WANT    = 22, /* S->C {u32 n, [str rel]...} 服务端要客户端把这些发来 */
-    MSG_PLAN         = 23  /* S->C {u32 push_files, u64 push_bytes, u32 pull_files,
+    MSG_PLAN         = 23, /* S->C {u32 push_files, u64 push_bytes, u32 pull_files,
                                      u64 pull_bytes} 先告诉客户端要做多少事，
                                      好让它的进度条贯穿整场同步而不是每块重来 */
+    MSG_UPLOAD_CODE  = 24, /* S->C {str code} 服务端要接收文件，先把六位验证码发下来
+                                     让客户端显示在屏幕上；操作者在服务端那头输入它
+                                     来批准这次写入。客户端只展示，不用回应 */
+    /* ---- 第二步握手：能力协商。加字段往这里加，HELLO/HELLO_ACK 不动 ---- */
+    MSG_HELLO2       = 25, /* C->S {str name, str root, u8 mtime_ok, u8 has_aes} */
+    MSG_HELLO2_ACK   = 26  /* S->C {str sname, str sroot, u8 prefer, u8 del,
+                                     str client_subdir, u8 hash_algo} */
 };
 
 /* 单个清单分片的条目上限 */
@@ -224,20 +240,36 @@ void       flist_sort(FileList *l);
 /* 只 stat 不算内容哈希：几万个文件也很快 */
 int  fs_scan(const char *root, FileList *out, char *err, size_t errlen);
 
-/* ---------------- 内容哈希（gxhash） ---------------- */
+/* ---------------- 内容哈希 ---------------- */
 
 /*
  * 判定「内容有没有变」本来只看 大小+修改时间，零读取。哈希是补前者的漏：
  * 大小没变、时间戳又不可比（或不可信）时，只有读内容才发现得了。
  *
- * ls_hash_ok 是硬门槛：gxhash 直接用 ARMv8-A 的 aes 指令，CPU 没有就是
- * 一条 SIGILL，所以启动时先问内核（AT_HWCAP），没有就让哈希功能整体缺席，
- * 同步退回比大小，而不是崩掉。
+ * 两种算法。**数值进协议，别改**：
+ *
+ *   GXHASH  用 ARMv8-A 的 AES 指令当混合器，实测 59–68 GiB/s，白送。
+ *           但它**没有软件回退**（上游明确 compile_error），CPU 没 AES
+ *           就是一条 SIGILL —— 所以必须先问内核。
+ *   SHA3    wolfSSL 的纯软件实现，任何 CPU 都能跑。实测是本机软件哈希里最快的
+ *           （~450 MiB/s，比 SHA-512/BLAKE2s/SHA-256 都快）。它比网络
+ *           （手机热点 37 MB/s，5G/WiFi 上限约 100 MB/s）快 5–13 倍，
+ *           所以「没有 AES」并不等于「用不了内容哈希」。
+ *
+ * **两端必须用同一个算法**，否则同一文件两边算出的值完全不同、根本没法比。
+ * 所以由服务端定：两个都有 AES 就用 gxhash，否则一律退到 SHA3 —— 客户端在
+ * HELLO 里报自己有没有 AES，服务端据此回一个 algo，客户端照它算。
  */
-int ls_hash_ok(void);
+enum { LS_HASH_NONE = 0, LS_HASH_GXHASH = 1, LS_HASH_SHA3 = 2 };
 
-/* 算一个文件的内容哈希；成功返回 0 并写 *out，失败返回 -1（*out 不动） */
-int ls_hash_file(const char *path, uint64_t *out);
+/* 本机 gxhash 能不能用（有没有 AES 指令）。LANSYNC_NO_HASH=1 可强制为否，
+ * 用来测「另一端没有 AES」这条路。 */
+int ls_gxhash_ok(void);
+
+/* 用指定算法算一个文件的内容哈希；成功返回 0 并写 *out，失败返回 -1。
+ * algo 取 LS_HASH_GXHASH 或 LS_HASH_SHA3。算出的值保证非 0
+ * （协议里 0 表示「这个条目的内容没算过」）。 */
+int ls_hash_file_algo(const char *path, int algo, uint64_t *out);
 
 /*
  * 采样文件开头若干字节，算香农熵（bit/byte，0~8）。
