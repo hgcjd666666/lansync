@@ -1404,7 +1404,12 @@ int ls_send_bundle(int fd, const char *root, const BundleEntry *ents, size_t n, 
     char first_local_err[512] = {0};
 
     memset(&zs, 0, sizeof(zs));
-    if (compress && deflateInit(&zs, Z_DEFAULT_COMPRESSION) == Z_OK) {
+    /*
+     * 级别取 1 而不是默认的 6：局域网也就 30~80 MB/s，而 level 6 的压缩速度
+     * 只有 ~50 MB/s，会把网络晾着；level 1 有 ~150 MB/s，压缩不再是瓶颈，
+     * 压缩率只差几个百分点。
+     */
+    if (compress && deflateInit(&zs, LS_COMPRESS_LEVEL) == Z_OK) {
         zok = 1;
         zbuf = (uint8_t *)malloc(LS_CHUNK);
         if (!zbuf) {

@@ -429,9 +429,9 @@ section "用例 16：压缩传输（auto 只看熵决定压不压）"
 SRV="$WORK/c16/srv"; CLI="$WORK/c16/cli"
 mkdir -p "$SRV" "$CLI"
 # 低熵：重复文本 + 全零；高熵：随机数据
-yes "这是一段会重复非常多次的文本，用来把熵压得很低。" 2>/dev/null | head -c 2000000 > "$SRV/texty.log" || true
-head -c 500000 /dev/zero > "$SRV/zeros.bin"
-head -c 1500000 /dev/urandom > "$SRV/random.bin"
+yes "这是一段会重复非常多次的文本，用来把熵压得很低。" 2>/dev/null | head -c 800000 > "$SRV/texty.log" || true
+head -c 200000 /dev/zero > "$SRV/zeros.bin"
+head -c 600000 /dev/urandom > "$SRV/random.bin"
 
 start_server "$SRV" -v
 run_client "$CLI" >/dev/null
@@ -447,7 +447,7 @@ cmp -s "$SRV/texty.log" "$CLI/texty.log" && ok "低熵文件解压后一致" || 
 section "用例 17：--no-compress 时不压缩，内容依然正确"
 SRV="$WORK/c17/srv"; CLI="$WORK/c17/cli"
 mkdir -p "$SRV" "$CLI"
-yes "重复内容重复内容重复内容重复内容" 2>/dev/null | head -c 1000000 > "$SRV/a.log" || true
+yes "重复内容重复内容重复内容重复内容" 2>/dev/null | head -c 500000 > "$SRV/a.log" || true
 
 start_server "$SRV" -v --no-compress
 run_client "$CLI" >/dev/null

@@ -38,6 +38,8 @@
 enum { LS_COMPRESS_AUTO = 0, LS_COMPRESS_ON = 1, LS_COMPRESS_OFF = 2 };
 /* auto 模式下，采样平均熵低于这个值才压 */
 #define LS_COMPRESS_ENTROPY_MAX 6.5
+/* 压缩级别：以速度优先，见 common.c 里的说明 */
+#define LS_COMPRESS_LEVEL 1
 
 /* 一个 bundle 最多装多少字节 / 多少个条目，超过就切开 */
 #define LS_BUNDLE_BYTES (64ull * 1024 * 1024)
